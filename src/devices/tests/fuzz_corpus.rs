@@ -41,3 +41,9 @@ fn vsock_packets_corpus() {
 fn fuse_requests_corpus() {
     replay("fuse_requests", msb_krun_devices::fuse_requests);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fuse_worker_corpus() {
+    replay("fuse_worker", msb_krun_devices::fuse_worker);
+}

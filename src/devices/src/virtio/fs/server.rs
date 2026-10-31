@@ -1738,6 +1738,32 @@ mod tests {
     use super::*;
     use crate::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType};
 
+    /// A create-like request body of a name and one extension header that announces `size`
+    /// bytes, followed by `present` bytes of extension data.
+    fn extension_request(size: u32, present: usize) -> Vec<u8> {
+        let mut body = b"n\0".to_vec();
+        body.extend_from_slice(ByteValued::as_slice(&ExtHeader { size, ext_type: 0 }));
+        body.resize(body.len() + present, 0);
+        body
+    }
+
+    /// Linux backends never negotiate SECURITY_CTX, so no FUSE request reaches this path there
+    /// and the fuzz targets cannot drive it; macOS and Windows backends do.
+    #[test]
+    fn an_extension_longer_than_its_request_is_refused_not_split() {
+        let options = FsOptions::SECURITY_CTX;
+        for (size, present) in [(1008u32, 0usize), (1008, 99), (u32::MAX, 4), (9, 0)] {
+            let body = extension_request(size, present);
+            assert!(
+                get_extensions(options, 2, &body).is_err(),
+                "size {size} with {present} bytes present"
+            );
+        }
+        // An empty security context fits exactly and is accepted.
+        let body = extension_request(8, 0);
+        assert!(get_extensions(options, 2, &body).is_ok());
+    }
+
     const STALE_INODE: u64 = 99;
     const REPLY_SENTINEL: u8 = 0xa5;
 

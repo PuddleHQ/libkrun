@@ -28,6 +28,8 @@ pub use virtio::fs::fuzzing::{fuse_dyn_session, fuse_requests, fuse_worker, serv
 pub use virtio::fuzzing::{guest_memory, virtqueue_chain};
 #[cfg(feature = "fuzzing")]
 pub use virtio::vsock::fuzzing::vsock_packets;
+#[cfg(all(feature = "fuzzing", unix))]
+pub use virtio::vsock::vsock_tsi;
 pub mod virtio;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;

@@ -49,3 +49,10 @@ path = "fuzz_targets/fuse_worker.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "vsock_tsi"
+path = "fuzz_targets/vsock_tsi.rs"
+test = false
+doc = false
+bench = false

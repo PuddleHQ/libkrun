@@ -28,7 +28,7 @@ use nix::sys::socket::{sockaddr, AddressFamily};
 #[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
-use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::{self, Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
 
 use super::super::DescriptorChain;
 use super::defs;
@@ -200,10 +200,13 @@ pub struct TsiReleaseReq {
 /// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
 /// - the chain head, holding the packet header; and
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
+///
+/// A TX packet whose data spans several descriptors is copied into `owned_buf`.
 pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
     buf_size: usize,
+    owned_buf: Option<Vec<u8>>,
 }
 
 fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
@@ -217,9 +220,10 @@ fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
 impl VsockPacket {
     /// Create the packet wrapper from a TX virtq chain head.
     ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
+    /// The chain head is expected to hold valid packet header data. The data may follow the
+    /// header in the head descriptor and may span any number of descriptors after it: Linux
+    /// 6.12.y sends a write over about 32 KiB with one descriptor per page fragment. Bounds and
+    /// pointer checks are performed when creating the wrapper.
     pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
         // All buffers in the TX queue must be readable.
         //
@@ -237,6 +241,7 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
 
         // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
@@ -249,26 +254,62 @@ impl VsockPacket {
         if pkt.len() > defs::MAX_PKT_BUF_SIZE as u32 {
             return Err(VsockError::InvalidPktLen(pkt.len()));
         }
+        let pkt_len = pkt.len() as usize;
+        let head_data = head.len as usize - VSOCK_PKT_HDR_SIZE;
 
-        // If the packet header showed a non-zero length, there should be a data descriptor here.
-        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
+        if head_data == 0 {
+            // If the packet header showed a non-zero length, there should be a data descriptor
+            // here.
+            let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
 
-        // TX data should be read-only.
-        if buf_desc.is_write_only() {
-            return Err(VsockError::UnreadableDescriptor);
+            // TX data should be read-only.
+            if buf_desc.is_write_only() {
+                return Err(VsockError::UnreadableDescriptor);
+            }
+
+            // All the data in one descriptor: use it in place.
+            if buf_desc.len as usize >= pkt_len {
+                pkt.buf_size = buf_desc.len as usize;
+                pkt.buf = Some(
+                    get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+                        .map_err(VsockError::GuestMemoryMmap)?,
+                );
+                return Ok(pkt);
+            }
         }
 
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if buf_desc.len < pkt.len() {
-            return Err(VsockError::BufDescTooSmall);
+        // The data is spread over the head and/or several descriptors: copy exactly the declared
+        // length, in chain order, and read no descriptor past it.
+        let mut data = vec![0u8; pkt_len];
+        let mut filled = head_data.min(pkt_len);
+        head.mem
+            .read_slice(
+                &mut data[..filled],
+                head.addr
+                    .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                    .ok_or(VsockError::GuestMemoryBounds)?,
+            )
+            .map_err(VsockError::GuestMemoryMmap)?;
+        let mut next = head.next_descriptor();
+        while filled < pkt_len {
+            let desc = match next {
+                Some(desc) => desc,
+                None if filled == 0 => return Err(VsockError::BufDescMissing),
+                None => return Err(VsockError::BufDescTooSmall),
+            };
+            if desc.is_write_only() {
+                return Err(VsockError::UnreadableDescriptor);
+            }
+            let n = (desc.len as usize).min(pkt_len - filled);
+            desc.mem
+                .read_slice(&mut data[filled..filled + n], desc.addr)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            filled += n;
+            next = desc.next_descriptor();
         }
 
-        pkt.buf_size = buf_desc.len as usize;
-        pkt.buf = Some(
-            get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                .map_err(VsockError::GuestMemoryMmap)?,
-        );
+        pkt.buf_size = pkt_len;
+        pkt.owned_buf = Some(data);
 
         Ok(pkt)
     }
@@ -294,6 +335,7 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -344,6 +386,9 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf(&self) -> Option<&[u8]> {
+        if let Some(owned) = &self.owned_buf {
+            return Some(owned);
+        }
         self.buf.map(|ptr| {
             // This is safe since bound checks have already been performed when creating the packet
             // from the virtq descriptor.
@@ -369,6 +414,9 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
+        if let Some(owned) = &mut self.owned_buf {
+            return Some(owned);
+        }
         self.buf.map(|ptr| {
             // This is safe since bound checks have already been performed when creating the packet
             // from the virtq descriptor.
@@ -804,6 +852,7 @@ pub(crate) mod guarded_buf {
                 hdr: hdr.as_mut_ptr(),
                 buf: Some(self.start),
                 buf_size: self.len,
+                owned_buf: None,
             }
         }
     }
@@ -917,5 +966,183 @@ mod tsi_parser_tests {
         let buf = GuardedBuf::new(&contents);
         let req = buf.packet(&mut hdr).read_connect_req().unwrap();
         assert_eq!(req.peer_port, 1234);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::{Bytes, GuestMemoryMmap};
+
+    use super::*;
+    use crate::virtio::Descriptor;
+
+    const DESC_TABLE: u64 = 0x1000;
+    const HEADER: u64 = 0x2000;
+    const MEM_SIZE: usize = 0x40000;
+    const NEXT: u16 = 1;
+
+    /// Writes a TX chain of `descs` (address, length) with a header declaring `declared_len`
+    /// bytes at `HEADER`, and parses it the way the device's TX queue does.
+    fn parse_tx(
+        mem: &GuestMemoryMmap,
+        declared_len: u32,
+        descs: &[(u64, u32)],
+    ) -> Result<VsockPacket> {
+        for (i, &(addr, len)) in descs.iter().enumerate() {
+            let last = i + 1 == descs.len();
+            mem.write_obj(
+                Descriptor {
+                    addr,
+                    len,
+                    flags: if last { 0 } else { NEXT },
+                    next: if last { 0 } else { i as u16 + 1 },
+                },
+                GuestAddress(DESC_TABLE + 16 * i as u64),
+            )
+            .unwrap();
+        }
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[HDROFF_LEN..HDROFF_LEN + 4].copy_from_slice(&declared_len.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(HEADER)).unwrap();
+        let head = DescriptorChain::checked_new(mem, GuestAddress(DESC_TABLE), 16, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head)
+    }
+
+    /// Bytes that differ per offset, so a dropped or reordered fragment changes the result.
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+    }
+
+    fn memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap()
+    }
+
+    /// Linux 6.12.y sends a write of over about 32 KiB as a nonlinear skb: the header in one
+    /// descriptor and the data in one descriptor per page fragment.
+    #[test]
+    fn a_payload_split_over_several_descriptors_is_gathered_in_order() {
+        let mem = memory();
+        let (a, b) = (pattern(0x8000, 1), pattern(0x8000, 2));
+        mem.write_slice(&a, GuestAddress(0x10000)).unwrap();
+        mem.write_slice(&b, GuestAddress(0x4000)).unwrap();
+
+        let pkt = parse_tx(
+            &mem,
+            0x10000,
+            &[
+                (HEADER, VSOCK_PKT_HDR_SIZE as u32),
+                (0x10000, 0x8000),
+                (0x4000, 0x8000),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(pkt.payload().unwrap(), [a, b].concat());
+    }
+
+    #[test]
+    fn data_after_the_header_in_the_head_descriptor_is_part_of_the_payload() {
+        let mem = memory();
+        let (inline, rest) = (pattern(100, 3), pattern(900, 4));
+        mem.write_slice(&inline, GuestAddress(HEADER + VSOCK_PKT_HDR_SIZE as u64))
+            .unwrap();
+        mem.write_slice(&rest, GuestAddress(0x4000)).unwrap();
+
+        let combined = parse_tx(&mem, 100, &[(HEADER, VSOCK_PKT_HDR_SIZE as u32 + 100)]).unwrap();
+        assert_eq!(combined.payload().unwrap(), &inline[..]);
+
+        let both = parse_tx(
+            &mem,
+            1000,
+            &[(HEADER, VSOCK_PKT_HDR_SIZE as u32 + 100), (0x4000, 900)],
+        )
+        .unwrap();
+        assert_eq!(both.payload().unwrap(), [inline, rest].concat());
+    }
+
+    /// Only the declared length is read: a descriptor past it is never touched, even one
+    /// that points outside guest memory.
+    #[test]
+    fn descriptors_past_the_declared_length_are_not_read() {
+        let mem = memory();
+        let data = pattern(0x3000, 5);
+        mem.write_slice(&data, GuestAddress(0x4000)).unwrap();
+
+        let pkt = parse_tx(
+            &mem,
+            0x3000,
+            &[
+                (HEADER, VSOCK_PKT_HDR_SIZE as u32),
+                (0x4000, 0x1000),
+                (0x5000, 0x8000),
+                (MEM_SIZE as u64 * 4, 0x10000),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(pkt.payload().unwrap(), &data[..]);
+    }
+
+    #[test]
+    fn a_chain_shorter_than_the_declared_length_is_refused() {
+        let mem = memory();
+
+        let short = parse_tx(
+            &mem,
+            0x10000,
+            &[
+                (HEADER, VSOCK_PKT_HDR_SIZE as u32),
+                (0x4000, 0x8000),
+                (0x10000, 0x7fff),
+            ],
+        );
+        assert!(matches!(short, Err(VsockError::BufDescTooSmall)));
+
+        let missing = parse_tx(&mem, 16, &[(HEADER, VSOCK_PKT_HDR_SIZE as u32)]);
+        assert!(matches!(missing, Err(VsockError::BufDescMissing)));
+    }
+
+    #[test]
+    fn a_writable_data_descriptor_is_refused() {
+        let mem = memory();
+        mem.write_obj(
+            Descriptor {
+                addr: HEADER,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: NEXT,
+                next: 1,
+            },
+            GuestAddress(DESC_TABLE),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x4000,
+                len: 0x100,
+                flags: NEXT,
+                next: 2,
+            },
+            GuestAddress(DESC_TABLE + 16),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x5000,
+                len: 0x100,
+                flags: 2,
+                next: 0,
+            },
+            GuestAddress(DESC_TABLE + 32),
+        )
+        .unwrap();
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[HDROFF_LEN..HDROFF_LEN + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(HEADER)).unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(DESC_TABLE), 16, 0).unwrap();
+
+        assert!(matches!(
+            VsockPacket::from_tx_virtq_head(&head),
+            Err(VsockError::UnreadableDescriptor)
+        ));
     }
 }

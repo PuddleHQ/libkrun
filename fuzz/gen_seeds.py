@@ -212,3 +212,33 @@ worker_seed("loop-on-itself", [desc(0x1_0000, 16, NEXT, 0)], [0])
 worker_seed("two-bad-then-good", [desc(0x4_0000, 8, 0, 0), desc(0x4_0000, 8, 0, 0), desc(0x1_0000, len(INIT), NEXT, 3), desc(0x1_1000, 0x1000, WRITE, 0)], [0, 1, 2], INIT)
 worker_seed("empty", [], [])
 worker_seed("queue-size-one", [desc(0x4_0000, 16, 0, 0)], [0], size_sel=0)
+
+
+# ---- vsock_tsi: the bytes of one TSI request buffer (no framing).
+def le32(v):
+    return struct.pack("<I", v)
+
+
+def tsi_seed(name, data):
+    put("vsock_tsi", name, data)
+
+
+AF_INET = struct.pack("<H", 2) + struct.pack(">H", 80) + bytes([10, 0, 0, 1]) + bytes(8)
+tsi_seed("connect-complete", le32(1234) + le32(16) + AF_INET)
+tsi_seed("connect-four-bytes", le32(1234))
+tsi_seed("connect-five-bytes", le32(1234) + b"\x10")
+tsi_seed("connect-eight-bytes", le32(1234) + le32(16))
+tsi_seed("connect-address-longer-than-buffer", le32(1234) + le32(16) + AF_INET[:6])
+tsi_seed("connect-address-length-huge", le32(1234) + le32(0xffff_ff00) + AF_INET)
+tsi_seed("sendto-eight-bytes", le32(1) + le32(16))
+tsi_seed("sendto-complete", le32(1) + le32(16) + AF_INET)
+tsi_seed("listen-complete", le32(1) + le32(2) + le32(128) + le32(16) + AF_INET)
+tsi_seed("listen-twelve-bytes", le32(1) + le32(2) + le32(128))
+tsi_seed("proxy-create-six-bytes", le32(7) + struct.pack("<H", 2))
+tsi_seed("proxy-create-complete", le32(7) + struct.pack("<HH", 2, 1))
+tsi_seed("getname-complete", le32(1) + le32(2) + le32(1))
+tsi_seed("accept-complete", le32(1) + le32(0))
+tsi_seed("release-complete", le32(1) + le32(2))
+tsi_seed("unix-path-no-nul", struct.pack("<H", 1) + b"a" * 106)
+tsi_seed("unix-path-with-nul", struct.pack("<H", 1) + b"/tmp/sock" + bytes(97))
+tsi_seed("empty", b"")

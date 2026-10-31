@@ -47,3 +47,9 @@ fn fuse_requests_corpus() {
 fn fuse_worker_corpus() {
     replay("fuse_worker", msb_krun_devices::fuse_worker);
 }
+
+#[cfg(unix)]
+#[test]
+fn vsock_tsi_corpus() {
+    replay("vsock_tsi", msb_krun_devices::vsock_tsi);
+}

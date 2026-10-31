@@ -21,7 +21,6 @@ use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(target_os = "macos")]
 use std::net::{Ipv6Addr, SocketAddrV6};
-use std::os::raw::c_char;
 use std::result;
 
 #[cfg(target_os = "linux")]
@@ -500,9 +499,9 @@ impl VsockPacket {
 
     pub fn unix_path(&self) -> Option<&str> {
         if self.buf_size >= 108 {
-            let cstr =
-                unsafe { CStr::from_ptr(&self.buf().unwrap()[2] as *const _ as *const c_char) };
-            cstr.to_str().ok()
+            // `sun_path` is not guaranteed to end in a NUL: stop at the end of the buffer.
+            let path = &self.buf().unwrap()[2..108];
+            CStr::from_bytes_until_nul(path).ok()?.to_str().ok()
         } else {
             None
         }
@@ -510,6 +509,10 @@ impl VsockPacket {
 
     #[cfg(target_os = "linux")]
     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        // The guest chose `addr_len`; the address must lie inside the buffer.
+        if addr_len as usize > buf.len() || buf.is_empty() {
+            return None;
+        }
         let sockaddr: SockaddrStorage = unsafe {
             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
         };
@@ -532,18 +535,28 @@ impl VsockPacket {
     }
 
     #[cfg(target_os = "macos")]
-    fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        if addr_len as usize > buf.len() || buf.len() < 2 {
+            return None;
+        }
+        let buf = &buf[..addr_len as usize];
         let family: u16 = byte_order::read_le_u16(&buf[0..2]);
 
         match family {
             defs::LINUX_AF_INET => {
                 debug!("parse_address: AF_INET");
+                if buf.len() < 8 {
+                    return None;
+                }
                 let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
                 let in_addr = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
                 Some(SocketAddrV4::new(in_addr, in_port).into())
             }
             defs::LINUX_AF_INET6 => {
                 debug!("parse_address: AF_INET6");
+                if buf.len() < 28 {
+                    return None;
+                }
                 let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
                 let flowinfo: u32 = byte_order::read_be_u32(&buf[4..8]);
                 let in6_addr = Ipv6Addr::new(
@@ -571,7 +584,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
-        if self.buf_size >= 6 {
+        if self.buf_size >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
             let family: u16 = byte_order::read_le_u16(&self.buf().unwrap()[4..]);
             let _type: u16 = byte_order::read_le_u16(&self.buf().unwrap()[6..]);
@@ -588,7 +601,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
-        if self.buf_size >= 4 {
+        if self.buf_size >= 8 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
@@ -656,7 +669,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
-        if self.buf_size >= 4 {
+        if self.buf_size >= 8 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
@@ -670,7 +683,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
-        if self.buf_size >= 12 {
+        if self.buf_size >= 16 {
             let buf = self.buf().unwrap();
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let vm_port: u32 = byte_order::read_le_u32(&buf[4..]);
@@ -739,5 +752,170 @@ impl VsockPacket {
                 byte_order::write_le_u64(&mut buf[0..], time);
             }
         }
+    }
+}
+
+/// A guest buffer that ends exactly at an inaccessible page, so a parser that reads past the
+/// descriptor faults instead of reading its neighbour.
+#[cfg(all(unix, any(test, feature = "fuzzing")))]
+pub(crate) mod guarded_buf {
+    const PAGE: usize = 4096;
+
+    pub(crate) struct GuardedBuf {
+        base: *mut u8,
+        pub(crate) start: *mut u8,
+        pub(crate) len: usize,
+    }
+
+    impl GuardedBuf {
+        /// `contents` must be at most one page.
+        pub(crate) fn new(contents: &[u8]) -> Self {
+            assert!(contents.len() <= PAGE);
+            // SAFETY: a private anonymous mapping of two pages, unmapped in `drop`; the second
+            // page is made inaccessible before any access.
+            unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * PAGE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .cast::<u8>();
+                assert_ne!(base.cast(), libc::MAP_FAILED);
+                assert_eq!(
+                    libc::mprotect(base.add(PAGE).cast(), PAGE, libc::PROT_NONE),
+                    0
+                );
+                let start = base.add(PAGE - contents.len());
+                std::ptr::copy_nonoverlapping(contents.as_ptr(), start, contents.len());
+                Self {
+                    base,
+                    start,
+                    len: contents.len(),
+                }
+            }
+        }
+
+        /// The packet a TX descriptor of this buffer yields (header unused by the parsers).
+        pub(crate) fn packet(&self, hdr: &mut [u8; 44]) -> super::VsockPacket {
+            super::VsockPacket {
+                hdr: hdr.as_mut_ptr(),
+                buf: Some(self.start),
+                buf_size: self.len,
+            }
+        }
+    }
+
+    impl Drop for GuardedBuf {
+        fn drop(&mut self) {
+            // SAFETY: the mapping made in `new`.
+            unsafe { libc::munmap(self.base.cast(), 2 * PAGE) };
+        }
+    }
+}
+
+/// Fuzz entry point for the TSI request parsers (feature `fuzzing`).
+#[cfg(all(unix, feature = "fuzzing"))]
+pub mod fuzzing {
+    use super::guarded_buf::GuardedBuf;
+
+    /// Every TSI request parser over one guest buffer that ends at an inaccessible page.
+    ///
+    /// The muxer reaches these parsers only with TSI on, and acting on a parsed request opens
+    /// host sockets, so the target stops at the parsers and uses what they return.
+    pub fn vsock_tsi(data: &[u8]) {
+        let payload = &data[..data.len().min(2048)];
+        let buf = GuardedBuf::new(payload);
+        let mut hdr = [0u8; 44];
+        let pkt = buf.packet(&mut hdr);
+        if let Some(req) = pkt.read_proxy_create() {
+            let _ = (req.peer_port, req.family, req._type);
+        }
+        if let Some(req) = pkt.read_connect_req() {
+            let _ = (req.peer_port, format!("{:?}", req.addr));
+        }
+        if let Some(req) = pkt.read_sendto_addr() {
+            let _ = (req.peer_port, format!("{:?}", req.addr));
+        }
+        if let Some(req) = pkt.read_listen_req() {
+            let _ = (req.peer_port, req.vm_port, format!("{:?}", req.addr));
+        }
+        let _ = pkt.read_getname_req().map(|r| (r.peer_port, r.local_port));
+        let _ = pkt.read_accept_req().map(|r| (r.peer_port, r.flags));
+        let _ = pkt.read_release_req().map(|r| (r.peer_port, r.local_port));
+        let _ = pkt.unix_path();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tsi_parser_tests {
+    use super::guarded_buf::GuardedBuf;
+
+    fn le32(v: u32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+
+    #[test]
+    fn unix_path_without_a_nul_stays_inside_the_buffer() {
+        let mut contents = vec![b'a'; 108];
+        contents[..2].copy_from_slice(&1u16.to_le_bytes());
+        let buf = GuardedBuf::new(&contents);
+        let mut hdr = [0u8; 44];
+        assert_eq!(buf.packet(&mut hdr).unix_path(), None);
+    }
+
+    #[test]
+    fn short_requests_are_refused_not_indexed() {
+        let mut hdr = [0u8; 44];
+        // proxy create reads 8 bytes, connect and sendto 8 plus the address, listen 16 plus it.
+        for len in 0..8 {
+            let buf = GuardedBuf::new(&vec![0u8; len]);
+            assert!(buf.packet(&mut hdr).read_proxy_create().is_none(), "{len}");
+        }
+        for len in 0..=8 {
+            let mut contents = vec![0u8; len];
+            if len >= 8 {
+                contents[4..8].copy_from_slice(&le32(16));
+            }
+            let buf = GuardedBuf::new(&contents);
+            assert!(buf.packet(&mut hdr).read_connect_req().is_none(), "{len}");
+            assert!(buf.packet(&mut hdr).read_sendto_addr().is_none(), "{len}");
+        }
+        for len in 0..=16 {
+            let mut contents = vec![0u8; len];
+            if len >= 16 {
+                contents[12..16].copy_from_slice(&le32(16));
+            }
+            let buf = GuardedBuf::new(&contents);
+            assert!(buf.packet(&mut hdr).read_listen_req().is_none(), "{len}");
+        }
+    }
+
+    #[test]
+    fn an_address_longer_than_the_buffer_is_refused() {
+        let mut hdr = [0u8; 44];
+        // An AF_INET sockaddr (16 bytes) announced, 6 bytes present.
+        let mut contents = vec![0u8; 8 + 6];
+        contents[4..8].copy_from_slice(&le32(16));
+        contents[8..10].copy_from_slice(&2u16.to_ne_bytes());
+        let buf = GuardedBuf::new(&contents);
+        assert!(buf.packet(&mut hdr).read_connect_req().is_none());
+        assert!(buf.packet(&mut hdr).read_sendto_addr().is_none());
+    }
+
+    #[test]
+    fn a_complete_connect_request_still_parses() {
+        let mut hdr = [0u8; 44];
+        let mut contents = vec![0u8; 8 + 16];
+        contents[0..4].copy_from_slice(&le32(1234));
+        contents[4..8].copy_from_slice(&le32(16));
+        contents[8..10].copy_from_slice(&2u16.to_ne_bytes());
+        contents[10..12].copy_from_slice(&80u16.to_be_bytes());
+        contents[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        let buf = GuardedBuf::new(&contents);
+        let req = buf.packet(&mut hdr).read_connect_req().unwrap();
+        assert_eq!(req.peer_port, 1234);
     }
 }

@@ -25,6 +25,8 @@ mod muxer_thread;
 #[allow(dead_code)]
 #[cfg(all(feature = "fuzzing", unix))]
 pub use self::muxer::fuzzing;
+#[cfg(all(feature = "fuzzing", unix))]
+pub use self::packet::fuzzing::vsock_tsi;
 mod packet;
 mod proxy;
 mod reaper;

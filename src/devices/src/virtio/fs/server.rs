@@ -610,7 +610,15 @@ impl<F: FileSystem + Sync> Server<F> {
         };
 
         // Split the writer into 2 pieces: one for the `OutHeader` and the rest for the data.
-        let data_writer = ZCWriter(w.split_at(size_of::<OutHeader>()).unwrap());
+        // A reply buffer too small even for the header cannot take any answer.
+        let Ok(data_writer) = w.split_at(size_of::<OutHeader>()) else {
+            return reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EINVAL)),
+                in_header.unique,
+                w,
+            );
+        };
+        let data_writer = ZCWriter(data_writer);
 
         match self.fs.read(
             Context::from(in_header),
@@ -1030,7 +1038,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
 
         // Skip over enough bytes for the header.
-        let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
+        let Ok(mut cursor) = w.split_at(size_of::<OutHeader>()) else {
+            return reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EINVAL)),
+                in_header.unique,
+                w,
+            );
+        };
 
         let res = if plus {
             self.fs.readdirplus(
@@ -1679,6 +1693,9 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
             .checked_sub(size_of::<ExtHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
 
+        if extension_size > remaining_bytes.len() {
+            return Err(Error::DecodeMessage(einval()));
+        }
         let (current_extension_bytes, next_extension_bytes) =
             remaining_bytes.split_at(extension_size);
 

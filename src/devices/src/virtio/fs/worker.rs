@@ -178,6 +178,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 return;
             }
 
+            let consumed_up_to = self.queues[queue_index].next_avail;
             if self.process_queue(queue_index) {
                 // Re-enable guest notification before returning ownership. The queue cursors are
                 // captured by the transport after the worker joins.
@@ -186,6 +187,13 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             }
 
             match self.queues[queue_index].enable_notification(&self.mem) {
+                Ok(true) if self.queues[queue_index].next_avail == consumed_up_to => {
+                    // The ring says a chain is available but `pop` refused its head (a bad head
+                    // index, a descriptor table outside guest memory), and nothing was consumed.
+                    // Looping again would spin on the same head for as long as the guest leaves it.
+                    error!("Fs: the next available chain is unusable, leaving the queue");
+                    break;
+                }
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {

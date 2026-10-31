@@ -242,3 +242,11 @@ tsi_seed("release-complete", le32(1) + le32(2))
 tsi_seed("unix-path-no-nul", struct.pack("<H", 1) + b"a" * 106)
 tsi_seed("unix-path-with-nul", struct.pack("<H", 1) + b"/tmp/sock" + bytes(97))
 tsi_seed("empty", b"")
+
+
+# A head `pop` refuses (a head index past the queue size) while the ring claims chains are
+# available: the worker once spun on it forever.
+for name, idx in (("avail-head-refused-by-pop", 1), ("avail-idx-far-ahead-of-queue", 0xffff)):
+    img = bytearray(ring_image([desc(0x3_ff00, 1024, 0, 0)], [0xffff]))
+    img[0x1002:0x1004] = struct.pack("<H", idx)
+    put("fuse_worker", name, bytes([3]) + struct.pack("<H", len(img)) + img + struct.pack("<H", 0))

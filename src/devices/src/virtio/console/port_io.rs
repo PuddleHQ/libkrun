@@ -154,14 +154,125 @@ pub fn input_empty() -> io::Result<Box<dyn PortInput + Send>> {
     Ok(Box::new(PortInputEmpty {}))
 }
 
+/// The most bytes a console log file takes per boot. The guest writes it, so without a cap a
+/// guest that prints in a loop fills the host disk. Output past the cap is dropped and the guest
+/// sees every write succeed.
+pub const CONSOLE_LOG_CAP: u64 = 16 * 1024 * 1024;
+
+const CAP_MARKER: &[u8] = b"\n[console log capped by the host; later output dropped]\n";
+
+/// Passes writes to `inner` until `left` bytes went through, then drops the rest.
+pub struct CappedOutput<O> {
+    inner: O,
+    left: u64,
+    marked: bool,
+}
+
+impl<O> CappedOutput<O> {
+    pub fn new(inner: O, cap: u64) -> Self {
+        Self {
+            inner,
+            left: cap,
+            marked: false,
+        }
+    }
+}
+
+impl<O: PortOutput> PortOutput for CappedOutput<O> {
+    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
+        if buf.len() as u64 > self.left {
+            let keep = self.left as usize;
+            let sent = if keep == 0 {
+                0
+            } else {
+                let head = buf
+                    .subslice(0, keep)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                self.inner.write_volatile(&head)?
+            };
+            self.left -= sent as u64;
+            if sent < keep {
+                // A short write: the caller retries the rest against the same cap.
+                return Ok(sent);
+            }
+            if !self.marked {
+                self.marked = true;
+                let mut marker = CAP_MARKER.to_vec();
+                let _ = self
+                    .inner
+                    .write_volatile(&VolatileSlice::from(&mut marker[..]));
+            }
+            return Ok(buf.len());
+        }
+        let sent = self.inner.write_volatile(buf)?;
+        self.left -= sent as u64;
+        Ok(sent)
+    }
+
+    fn wait_until_writable(&self) {
+        self.inner.wait_until_writable()
+    }
+}
+
+/// The same cap for an `io::Write` sink (the Windows serial console).
+pub struct CappedWriter<W> {
+    inner: W,
+    left: u64,
+    marked: bool,
+}
+
+impl<W> CappedWriter<W> {
+    pub fn new(inner: W, cap: u64) -> Self {
+        Self {
+            inner,
+            left: cap,
+            marked: false,
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for CappedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            let keep = self.left as usize;
+            let sent = if keep == 0 {
+                0
+            } else {
+                self.inner.write(&buf[..keep])?
+            };
+            self.left -= sent as u64;
+            if sent < keep {
+                return Ok(sent);
+            }
+            if !self.marked {
+                self.marked = true;
+                let _ = self.inner.write_all(CAP_MARKER);
+            }
+            return Ok(buf.len());
+        }
+        let sent = self.inner.write(buf)?;
+        self.left -= sent as u64;
+        Ok(sent)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(unix)]
 pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
-    output_to_raw_fd_dup(file.as_raw_fd())
+    let inner = PortOutputFd(dup_raw_fd_into_owned(file.as_raw_fd())?);
+    make_non_blocking(&inner.0)?;
+    Ok(Box::new(CappedOutput::new(inner, CONSOLE_LOG_CAP)))
 }
 
 #[cfg(windows)]
 pub fn output_file(file: File) -> io::Result<Box<dyn PortOutput + Send>> {
-    Ok(Box::new(PortOutputFile(file)))
+    Ok(Box::new(CappedOutput::new(
+        PortOutputFile(file),
+        CONSOLE_LOG_CAP,
+    )))
 }
 
 #[cfg(windows)]
@@ -1345,5 +1456,108 @@ mod tests {
         let suffix = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         format!(r"\\.\pipe\msb-krun-console-test-{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// Records what reaches the "disk" and writes at most `chunk` bytes per call.
+    struct Sink {
+        got: Vec<u8>,
+        chunk: usize,
+    }
+
+    impl PortOutput for Sink {
+        fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
+            let n = buf.len().min(self.chunk);
+            let mut tmp = vec![0u8; n];
+            buf.subslice(0, n).unwrap().copy_to(&mut tmp);
+            self.got.extend_from_slice(&tmp);
+            Ok(n)
+        }
+
+        fn wait_until_writable(&self) {}
+    }
+
+    fn flood(out: &mut (impl PortOutput + ?Sized), total: usize, write: usize) {
+        let mut sent = 0;
+        while sent < total {
+            let mut line = vec![b'x'; write];
+            let slice = VolatileSlice::from(&mut line[..]);
+            let mut off = 0;
+            // Retry short writes the way the console port does.
+            while off < write {
+                off += out.write_volatile(&slice.offset(off).unwrap()).unwrap();
+            }
+            sent += write;
+        }
+    }
+
+    #[test]
+    fn output_floods_past_the_cap_stop_at_the_cap_and_say_so_once() {
+        let mut out = CappedOutput::new(
+            Sink {
+                got: Vec::new(),
+                chunk: 700,
+            },
+            10_000,
+        );
+        flood(&mut out, 1_000_000, 4096);
+        let got = &out.inner.got;
+        assert_eq!(got.len(), 10_000 + CAP_MARKER.len());
+        assert!(got[..10_000].iter().all(|b| *b == b'x'));
+        assert_eq!(&got[10_000..], CAP_MARKER);
+    }
+
+    #[test]
+    fn output_under_the_cap_is_untouched() {
+        let mut out = CappedOutput::new(
+            Sink {
+                got: Vec::new(),
+                chunk: usize::MAX,
+            },
+            10_000,
+        );
+        flood(&mut out, 8192, 4096);
+        assert_eq!(out.inner.got.len(), 8192);
+    }
+
+    #[test]
+    fn a_write_that_ends_exactly_on_the_cap_is_whole_and_unmarked() {
+        let mut out = CappedOutput::new(
+            Sink {
+                got: Vec::new(),
+                chunk: usize::MAX,
+            },
+            8192,
+        );
+        flood(&mut out, 8192, 4096);
+        assert_eq!(out.inner.got.len(), 8192);
+    }
+
+    #[test]
+    fn writer_floods_past_the_cap_stop_at_the_cap() {
+        use std::io::Write;
+        let mut out = CappedWriter::new(Vec::new(), 10_000);
+        for _ in 0..1000 {
+            assert_eq!(out.write(&[b'y'; 4096]).unwrap(), 4096);
+        }
+        assert_eq!(out.inner.len(), 10_000 + CAP_MARKER.len());
+        assert_eq!(&out.inner[10_000..], CAP_MARKER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_log_file_stops_growing_at_the_cap() {
+        let path = std::env::temp_dir().join(format!("msb-krun-cap-{}.log", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut out = output_file(file).unwrap();
+        // Twice the production cap, in 64 KiB writes like a guest printing in a loop.
+        flood(&mut *out, 2 * CONSOLE_LOG_CAP as usize, 65536);
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(len, CONSOLE_LOG_CAP + CAP_MARKER.len() as u64);
     }
 }

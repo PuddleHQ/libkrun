@@ -55,6 +55,11 @@ impl Deref for Payload {
     }
 }
 
+/// The most control messages waiting for the guest. A normal guest has a few per port; one that
+/// floods PORT_READY or DEVICE_READY while it never posts receive buffers would otherwise grow
+/// this queue without limit. Messages past the cap are dropped.
+pub const MAX_QUEUED_MESSAGES: usize = 1024;
+
 // Utility for sending commands into control rx queue
 pub struct ConsoleControl {
     queue: Mutex<VecDeque<Payload>>,
@@ -135,18 +140,45 @@ impl ConsoleControl {
     }
 
     fn push_msg(&self, msg: VirtioConsoleControl) {
+        self.push(Payload::ConsoleControl(msg));
+    }
+
+    fn push_vec(&self, buf: Vec<u8>) {
+        self.push(Payload::Bytes(buf));
+    }
+
+    fn push(&self, payload: Payload) {
         let mut queue = self.queue.lock().expect("Poisoned lock");
-        queue.push_back(Payload::ConsoleControl(msg));
+        if queue.len() >= MAX_QUEUED_MESSAGES {
+            log::debug!("console control queue is full, dropping a message");
+            return;
+        }
+        queue.push_back(payload);
         if let Err(e) = self.queue_evt.write(1) {
             log::trace!("ConsoleControl failed to write to notify {e}")
         }
     }
+}
 
-    fn push_vec(&self, buf: Vec<u8>) {
-        let mut queue = self.queue.lock().expect("Poisoned lock");
-        queue.push_back(Payload::Bytes(buf));
-        if let Err(e) = self.queue_evt.write(1) {
-            log::trace!("ConsoleControl failed to write to notify {e}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_flood_of_messages_stops_at_the_cap_and_the_queue_still_drains() {
+        let control = ConsoleControl::new();
+        for i in 0..(MAX_QUEUED_MESSAGES as u32 * 10) {
+            control.port_add(i);
+            control.port_name(i, "flood");
         }
+        let mut n = 0;
+        while control.queue_pop().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_QUEUED_MESSAGES);
+
+        // Once drained, new messages are accepted again.
+        control.port_open(0, true);
+        assert!(control.queue_pop().is_some());
     }
 }

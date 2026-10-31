@@ -1556,7 +1556,10 @@ pub fn build_microvm_paused(
         let output: Box<dyn io::Write + Send> = if let Some(console_output_path) =
             &vm_resources.console_output
         {
-            Box::new(File::create(console_output_path).map_err(StartMicrovmError::OpenConsoleFile)?)
+            Box::new(port_io::CappedWriter::new(
+                File::create(console_output_path).map_err(StartMicrovmError::OpenConsoleFile)?,
+                port_io::CONSOLE_LOG_CAP,
+            ))
         } else {
             Box::new(io::stdout())
         };

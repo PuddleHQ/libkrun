@@ -181,3 +181,9 @@ fuse_seed("reply-buffer-zero", req("LOOKUP", body=cstr("file")), reply=0)
 # Linux passthrough backend. The init file is the inode after the root.
 fuse_seed("init-inode-read-past-end", req("READ", nodeid=2, body=struct.pack("<QQIIQII", 1, 1 << 40, 4096, 0, 0, 0, 0)),
           req("READ", nodeid=2, body=struct.pack("<QQIIQII", 1, 0xffff_ffff_ffff_fff0, 0xffff_ffff & 0xfffff, 0, 0, 0, 0)))
+
+# Found by fuse_requests: a reply buffer smaller than the 16-byte reply header panicked the
+# dispatcher in READ and READDIR (it split the header off with unwrap).
+fuse_seed("read-reply-smaller-than-header", req("READ", body=struct.pack("<QQIIQII", 1, 0, 64, 0, 0, 0, 0)), reply=8)
+fuse_seed("readdir-reply-smaller-than-header", req("OPENDIR", body=struct.pack("<II", 0, 0)),
+          req("READDIR", body=struct.pack("<QQIIQII", 1, 0, 4, 0, 0, 0, 0)), reply=8)

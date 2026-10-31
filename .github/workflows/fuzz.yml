@@ -1,0 +1,55 @@
+# Nightly fuzzing of what a guest reaches through the virtio devices (fuzz/): ten minutes per
+# target on a nightly toolchain, or by hand with another length. It gates nothing; a crash fails
+# the run and uploads the input, which becomes a regression input under fuzz/corpus/<target>/
+# (fuzz/README.md). The stable replay test src/devices/tests/fuzz_corpus.rs runs the checked-in
+# inputs on every test run.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [virtqueue_chain, vsock_packets, balloon_queues, fuse_requests, fuse_worker, vsock_tsi]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal && rustc +nightly --version
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      # The installed cargo-fuzz may default to a target the runner lacks, so name it.
+      - name: fuzz ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '600' }}
+          FUZZ_FUSE_ROOT: ${{ runner.temp }}
+        working-directory: fuzz
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "${{ matrix.target }}" -- -max_total_time="$SECONDS_PER_TARGET" -max_len=16384 -rss_limit_mb=2048 -timeout=30
+      - name: the crashing input
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/

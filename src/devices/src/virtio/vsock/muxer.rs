@@ -1410,3 +1410,171 @@ mod tests {
         assert!(peers.contains_key(&(1, 6000)));
     }
 }
+
+/// Fuzz entry point for the guest's vsock packets (feature `fuzzing`).
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use std::collections::HashMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use vm_memory::{Bytes, GuestAddress};
+
+    use super::super::packet::{VsockPacket, VSOCK_PKT_HDR_SIZE};
+    use super::super::{
+        TsiFlags, VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown,
+        VsockStreamBackend,
+    };
+    use super::{uapi, VirtQueue, VsockMuxer};
+    use crate::virtio::fuzzing::{guest_memory, le16, take};
+    use crate::virtio::{Descriptor, DescriptorChain};
+
+    /// A host service that takes every connection and at most 4 KiB per write.
+    struct Service;
+
+    struct Stream;
+
+    impl VsockPortBackend for Service {
+        fn connect(
+            &self,
+            _request: VsockConnectRequest,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockStreamBackend>> {
+            Ok(Box::new(Stream))
+        }
+    }
+
+    impl VsockStreamBackend for Stream {
+        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn write(&self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len().min(4096))
+        }
+
+        fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const HDR_AT: u64 = 0x1000;
+    const DATA_AT: u64 = 0x2000;
+    const TABLE_AT: u64 = 0;
+
+    fn head<'a>(
+        mem: &'a vm_memory::GuestMemoryMmap,
+        descs: &[Descriptor],
+    ) -> Option<DescriptorChain<'a>> {
+        for (i, d) in descs.iter().enumerate() {
+            mem.write_obj(*d, GuestAddress(TABLE_AT + 16 * i as u64))
+                .ok()?;
+        }
+        DescriptorChain::checked_new(mem, GuestAddress(TABLE_AT), 8, 0)
+    }
+
+    /// Guest packets as the TX queue delivers them, then the host's answers on the RX queue.
+    ///
+    /// Input: records of one flag byte, a 44-byte header, a 16-bit payload length and the
+    /// payload. Flags: 0x01 sends the packet as a datagram instead of a stream packet, 0x06
+    /// picks the header descriptor length (exact, too short, longer, past memory), 0x08 makes
+    /// the payload descriptor writable, 0x10 leaves the payload descriptor out, 0x20 makes it
+    /// shorter than the header says, 0x40 lets the host answer on an RX chain of random shape,
+    /// 0x80 aims the header at the host CID and a served port so the packet reaches the stream
+    /// code. The muxer serves port 5000 with an in-process stream.
+    pub fn vsock_packets(data: &[u8]) {
+        let mem = guest_memory();
+        let routes: HashMap<u32, Arc<dyn VsockPortBackend>> =
+            HashMap::from([(5000, Arc::new(Service) as Arc<dyn VsockPortBackend>)]);
+        let mut muxer = VsockMuxer::new(3, None, None, Some(routes), None, TsiFlags::empty());
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(8))));
+
+        let mut data = data;
+        for _ in 0..16 {
+            let Some(flags) = take(&mut data, 1).map(|b| b[0]) else {
+                return;
+            };
+            let Some(hdr) = take(&mut data, VSOCK_PKT_HDR_SIZE) else {
+                return;
+            };
+            let Some(plen) = take(&mut data, 2).map(le16) else {
+                return;
+            };
+            let n = usize::from(plen).min(data.len());
+            let payload = take(&mut data, n).unwrap_or(&[]);
+
+            let hdr_len = match (flags >> 1) & 3 {
+                0 => VSOCK_PKT_HDR_SIZE as u32,
+                1 => VSOCK_PKT_HDR_SIZE as u32 - 1,
+                2 => VSOCK_PKT_HDR_SIZE as u32 + 100,
+                _ => u32::MAX,
+            };
+            let _ = mem.write_slice(hdr, GuestAddress(HDR_AT));
+            let _ = mem.write_slice(payload, GuestAddress(DATA_AT));
+            let payload_len = if flags & 0x20 != 0 {
+                plen.saturating_sub(1)
+            } else {
+                plen
+            };
+            let mut descs = vec![Descriptor {
+                addr: HDR_AT,
+                len: hdr_len,
+                flags: if flags & 0x10 == 0 { 1 } else { 0 },
+                next: 1,
+            }];
+            if flags & 0x10 == 0 {
+                descs.push(Descriptor {
+                    addr: DATA_AT,
+                    len: u32::from(payload_len),
+                    flags: if flags & 0x08 != 0 { 2 } else { 0 },
+                    next: 0,
+                });
+            }
+            if let Some(chain) = head(&mem, &descs) {
+                if let Ok(mut pkt) = VsockPacket::from_tx_virtq_head(&chain) {
+                    if flags & 0x80 != 0 {
+                        pkt.set_dst_cid(uapi::VSOCK_HOST_CID)
+                            .set_dst_port(5000)
+                            .set_type(uapi::VSOCK_TYPE_STREAM);
+                    }
+                    // Everything the header says is read back through the accessors a parser uses.
+                    let _ = (pkt.src_cid(), pkt.dst_cid(), pkt.src_port(), pkt.dst_port());
+                    let _ = (pkt.len(), pkt.type_(), pkt.op(), pkt.flags());
+                    let _ = (pkt.buf_alloc(), pkt.fwd_cnt(), pkt.payload());
+                    let sent = if flags & 1 != 0 {
+                        muxer.send_dgram_pkt(&pkt)
+                    } else {
+                        muxer.send_stream_pkt(&pkt)
+                    };
+                    let _ = sent;
+                }
+            }
+
+            if flags & 0x40 != 0 {
+                let rx_descs = [
+                    Descriptor {
+                        addr: HDR_AT,
+                        len: VSOCK_PKT_HDR_SIZE as u32,
+                        flags: 3,
+                        next: 1,
+                    },
+                    Descriptor {
+                        addr: DATA_AT,
+                        len: u32::from(plen),
+                        flags: 2,
+                        next: 0,
+                    },
+                ];
+                if let Some(chain) = head(&mem, &rx_descs[..if flags & 0x20 != 0 { 1 } else { 2 }])
+                {
+                    if let Ok(mut rx) = VsockPacket::from_rx_virtq_head(&chain) {
+                        if muxer.recv_pkt(&mut rx).is_ok() {
+                            let _ = (rx.op(), rx.len(), rx.buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

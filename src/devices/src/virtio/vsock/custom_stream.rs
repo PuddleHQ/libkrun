@@ -1007,6 +1007,166 @@ mod tests {
         assert_eq!(proxy.pending_write.len(), defs::CONN_TX_BUF_SIZE);
     }
 
+    /// A guest data packet of `len` zero bytes, built in `mem` (at least 0x14000 bytes).
+    fn big_tx_packet(mem: &GuestMemoryMmap, len: usize) -> VsockPacket {
+        tx_packet(mem, len as u32, &vec![0u8; len])
+    }
+
+    /// A backend that never takes a byte: a host peer that does not read.
+    struct StalledStream;
+
+    impl VsockStreamBackend for StalledStream {
+        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stalled_proxy(mem: GuestMemoryMmap) -> CustomStreamProxy {
+        CustomStreamProxy::new(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(StalledStream),
+            VsockNotifier::new().unwrap(),
+            Arc::new(Epoll::new().unwrap()),
+            mem,
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap()
+    }
+
+    /// Flood one stream whose host peer never reads, with the largest packets a guest can
+    /// send. Returns the bytes the proxy accepted before it reset the stream.
+    fn flood_stalled_stream() -> usize {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let pkt = big_tx_packet(&mem, defs::MAX_PKT_BUF_SIZE);
+        let mut proxy = stalled_proxy(mem);
+        let mut accepted = 0;
+        // Twice the cap is far more than any cap under test; the loop ends on the reset.
+        for _ in 0..(1 << 20) / 4 {
+            let update = proxy.sendmsg(&pkt);
+            if !matches!(update.remove_proxy, ProxyRemoval::Keep) {
+                return accepted;
+            }
+            accepted += defs::MAX_PKT_BUF_SIZE;
+        }
+        panic!("stream never reset after {accepted} bytes");
+    }
+
+    /// A guest that writes and never reads costs the host at most `STREAM_BUFFER_LIMIT`
+    /// bytes per stream. The number is spelled out so that raising the constant fails here.
+    #[test]
+    fn a_stalled_peer_holds_at_most_two_mebibytes_per_stream() {
+        assert_eq!(flood_stalled_stream(), 2 * 1024 * 1024);
+    }
+
+    /// The window the host advertises is the same number the proxy enforces: a guest that
+    /// fills it exactly is accepted and one byte more is not.
+    #[test]
+    fn the_advertised_window_is_the_enforced_one() {
+        assert_eq!(defs::CONN_TX_BUF_SIZE, 2 * 1024 * 1024);
+    }
+
+    /// Cost of a flooding guest at the compiled-in limits: opens `STREAMS` connections to
+    /// real sockets whose peers never read, writes each until it is reset, and prints the
+    /// process's resident memory and descriptors. Run alone, under a memory cap:
+    /// `ulimit -v 8000000; cargo test -p msb_krun_devices --lib measure_flood_cost -- --ignored --nocapture`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "measurement, prints numbers; run on its own under a memory cap"]
+    fn measure_flood_cost() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        struct SocketBackend(UnixStream);
+
+        impl VsockStreamBackend for SocketBackend {
+            fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+                std::io::Read::read(&mut &self.0, buf)
+            }
+
+            fn write(&self, buf: &[u8]) -> io::Result<usize> {
+                std::io::Write::write(&mut &self.0, buf)
+            }
+
+            fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn pollable(&self) -> Option<std::os::fd::RawFd> {
+                Some(self.0.as_raw_fd())
+            }
+        }
+
+        fn rss_kib() -> u64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+            pages * 4
+        }
+
+        fn fds() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        let streams: usize = std::env::var("STREAMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let (rss0, fds0) = (rss_kib(), fds());
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let pkt = big_tx_packet(&mem, defs::MAX_PKT_BUF_SIZE);
+        let mut held = Vec::new();
+        let mut accepted = 0usize;
+        for i in 0..streams {
+            let (host, peer) = UnixStream::pair().unwrap();
+            host.set_nonblocking(true).unwrap();
+            let mut proxy = CustomStreamProxy::new(
+                i as u64,
+                3,
+                5000,
+                4000 + i as u32,
+                Box::new(SocketBackend(host)),
+                VsockNotifier::new().unwrap(),
+                Arc::new(Epoll::new().unwrap()),
+                mem.clone(),
+                Arc::new(Mutex::new(VirtQueue::new(256))),
+                Arc::new(Mutex::new(MuxerRxQ::new())),
+            )
+            .unwrap();
+            // The guest never reads, so it honours only the window we advertise.
+            loop {
+                let update = proxy.sendmsg(&pkt);
+                if !matches!(update.remove_proxy, ProxyRemoval::Keep) {
+                    break;
+                }
+                accepted += defs::MAX_PKT_BUF_SIZE;
+                if proxy.pending_write.len() + defs::MAX_PKT_BUF_SIZE > defs::CONN_TX_BUF_SIZE {
+                    break;
+                }
+            }
+            held.push((proxy, peer));
+        }
+        let (rss1, fds1) = (rss_kib(), fds());
+        println!(
+            "FLOOD streams={streams} window={} accepted_total={accepted} pending_total={} \
+             rss_delta_kib={} fds_delta={}",
+            defs::CONN_TX_BUF_SIZE,
+            held.iter().map(|(p, _)| p.pending_write.len()).sum::<usize>(),
+            rss1 - rss0,
+            fds1 - fds0
+        );
+    }
+
     /// Exercise the proxy-to-guest boundary with unread bytes in a real socket.
     /// Neither a hang-up nor temporary guest backpressure may discard the tail.
     #[cfg(unix)]

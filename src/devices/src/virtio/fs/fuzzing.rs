@@ -13,9 +13,12 @@ use super::filesystem::FileSystem;
 use super::fuse::{InHeader, InitInCompat, Opcode};
 use super::passthrough::{Config, PassthroughFs};
 use super::server::Server;
+use super::worker::FsWorker;
+use crate::legacy::DummyIrqChip;
 use crate::virtio::descriptor_utils::{Reader, Writer};
-use crate::virtio::fuzzing::{le16, take};
-use crate::virtio::{Descriptor, DescriptorChain};
+use crate::virtio::fuzzing::{guest_memory, le16, make_queue, take};
+use crate::virtio::{Descriptor, DescriptorChain, InterruptTransport};
+use utils::eventfd::EventFd;
 
 const REQUEST_AT: u64 = 0x1000;
 const REPLY_AT: u64 = 0x2_0000;
@@ -166,4 +169,65 @@ fn fuse_session<F: FileSystem + Sync>(fs: Arc<F>, data: &[u8]) {
         let reply = take(&mut data, 2).map(le16).unwrap_or(0x1000);
         dispatch(&server, &mem, request, u32::from(reply).min(0x1_0000));
     }
+}
+
+/// The FUSE worker over a queue the guest laid out, run the way the VMM runs it (one kick on the
+/// request queue), so a chain the dispatcher never sees reaches the worker's own code.
+///
+/// Input: one byte for the queue size, a 16-bit length and that many bytes of ring memory (the
+/// descriptor table at 0, the available ring at +0x1000, the used ring at +0x2000), then a
+/// 16-bit length and that many bytes of request memory at 0x1_0000. A panic in the worker thread
+/// is the finding.
+pub fn fuse_worker(data: &[u8]) {
+    let mut data = data;
+    let Some(size_sel) = take(&mut data, 1).map(|b| b[0]) else {
+        return;
+    };
+    let mem = guest_memory();
+    for base in [0, 0x1_0000] {
+        let Some(n) = take(&mut data, 2).map(le16) else {
+            break;
+        };
+        let n = usize::from(n).min(data.len()).min(0x3000);
+        let chunk = take(&mut data, n).unwrap_or(&[]);
+        let _ = mem.write_slice(chunk, GuestAddress(base));
+    }
+    let queues = [0x0, 0x4000]
+        .map(|base| {
+            let mut q = make_queue(size_sel % 5 + 1, false, base, &[]);
+            q.size = 1 << (size_sel % 5 + 1);
+            q
+        })
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    // The request queue is index 1: it takes the guest's ring at 0, the high-priority queue (index
+    // 0) an empty one at 0x4000.
+    assert!(queues.iter().all(|q| q.is_valid(&mem)));
+    let evts = queues
+        .iter()
+        .map(|_| Arc::new(EventFd::new(0).expect("eventfd")))
+        .collect::<Vec<_>>();
+    let tree = Tree::new();
+    let cfg = Config {
+        root_dir: tree.0.to_string_lossy().into_owned(),
+        ..Config::default()
+    };
+    let fs = PassthroughFs::new(cfg).expect("passthrough over the served tree");
+    let interrupt =
+        InterruptTransport::new(DummyIrqChip::new().into(), "fuzz".into()).expect("interrupt");
+    let mut worker = FsWorker::new(
+        Arc::new(fs),
+        queues,
+        evts.clone(),
+        interrupt,
+        mem,
+        None,
+        // Non-blocking, as the device makes it: the worker polls it between requests.
+        EventFd::new(libc::EFD_NONBLOCK).expect("eventfd"),
+        Arc::new(AtomicI32::new(0)),
+        0,
+    );
+    let _ = evts[1].write(1);
+    worker.handle_event_for_fuzz(1);
 }

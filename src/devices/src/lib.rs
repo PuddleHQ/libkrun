@@ -23,7 +23,7 @@ pub mod legacy;
 #[cfg(feature = "fuzzing")]
 pub use virtio::balloon::fuzzing::balloon_queues;
 #[cfg(all(feature = "fuzzing", target_os = "linux"))]
-pub use virtio::fs::fuzzing::{fuse_dyn_session, fuse_requests, served_tree};
+pub use virtio::fs::fuzzing::{fuse_dyn_session, fuse_requests, fuse_worker, served_tree};
 #[cfg(feature = "fuzzing")]
 pub use virtio::fuzzing::{guest_memory, virtqueue_chain};
 #[cfg(feature = "fuzzing")]

@@ -160,6 +160,12 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         }
     }
 
+    /// Runs one queue-event handler without the epoll thread, so a test can drive the worker.
+    #[cfg(feature = "fuzzing")]
+    pub(crate) fn handle_event_for_fuzz(&mut self, queue_index: usize) {
+        self.handle_event(queue_index);
+    }
+
     fn handle_event(&mut self, queue_index: usize) {
         debug!("Fs: queue event: {queue_index}");
         if let Err(e) = self.queue_evts[queue_index].read() {
@@ -167,9 +173,10 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         }
 
         loop {
-            self.queues[queue_index]
-                .disable_notification(&self.mem)
-                .unwrap();
+            if let Err(e) = self.queues[queue_index].disable_notification(&self.mem) {
+                error!("Fs: cannot disable guest notification, leaving the queue: {e:?}");
+                return;
+            }
 
             if self.process_queue(queue_index) {
                 // Re-enable guest notification before returning ownership. The queue cursors are
@@ -178,11 +185,13 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 return;
             }
 
-            if !self.queues[queue_index]
-                .enable_notification(&self.mem)
-                .unwrap()
-            {
-                break;
+            match self.queues[queue_index].enable_notification(&self.mem) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    error!("Fs: cannot enable guest notification, leaving the queue: {e:?}");
+                    break;
+                }
             }
         }
     }
@@ -203,12 +212,28 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             let Some(head) = queue.pop(&self.mem) else {
                 return false;
             };
-            let reader = Reader::new(&self.mem, head.clone())
+            // A chain the guest built badly (a descriptor outside its memory) is returned unused;
+            // it must not take the worker thread down.
+            let built = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
-                .unwrap();
-            let writer = Writer::new(&self.mem, head.clone())
-                .map_err(FsError::QueueWriter)
-                .unwrap();
+                .and_then(|reader| {
+                    Writer::new(&self.mem, head.clone())
+                        .map_err(FsError::QueueWriter)
+                        .map(|writer| (reader, writer))
+                });
+            let (reader, writer) = match built {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!("dropping a request with an unusable descriptor chain: {e:?}");
+                    if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                    if queue.needs_notification(&self.mem).unwrap_or(true) {
+                        self.interrupt.signal_used_queue();
+                    }
+                    continue;
+                }
+            };
 
             if let Err(e) = self.server.handle_message(
                 reader,
@@ -225,7 +250,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if queue.needs_notification(&self.mem).unwrap() {
+            if queue.needs_notification(&self.mem).unwrap_or(true) {
                 self.interrupt.signal_used_queue();
             }
         }

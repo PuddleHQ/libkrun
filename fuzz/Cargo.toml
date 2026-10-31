@@ -42,3 +42,10 @@ path = "fuzz_targets/fuse_requests.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuse_worker"
+path = "fuzz_targets/fuse_worker.rs"
+test = false
+doc = false
+bench = false

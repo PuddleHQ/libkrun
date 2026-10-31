@@ -187,3 +187,28 @@ fuse_seed("init-inode-read-past-end", req("READ", nodeid=2, body=struct.pack("<Q
 fuse_seed("read-reply-smaller-than-header", req("READ", body=struct.pack("<QQIIQII", 1, 0, 64, 0, 0, 0, 0)), reply=8)
 fuse_seed("readdir-reply-smaller-than-header", req("OPENDIR", body=struct.pack("<II", 0, 0)),
           req("READDIR", body=struct.pack("<QQIIQII", 1, 0, 4, 0, 0, 0, 0)), reply=8)
+
+
+# ---- fuse_worker: a size byte, then a 16-bit length and ring memory for the request queue, then a
+# 16-bit length and request memory placed at 0x1_0000.
+def worker_seed(name, descs, avail, request=b"", size_sel=3):
+    ring = ring_image(descs, avail)
+    out = bytes([size_sel]) + struct.pack("<H", len(ring)) + ring
+    out += struct.pack("<H", len(request)) + request
+    put("fuse_worker", name, out)
+
+
+INIT = struct.pack("<IIQQIIIIHHHHIIII", 56, 26, 1, 1, 0, 0, 0, 0, 7, 38, 0, 0, 0, 0, 0, 0)[:56]
+GETATTR = struct.pack("<IIQQIIII", 40, 3, 2, 1, 0, 0, 0, 0) + bytes(16)
+worker_seed("init", [desc(0x1_0000, len(INIT), NEXT, 1), desc(0x1_1000, 0x1000, WRITE, 0)], [0], INIT)
+worker_seed("getattr-after-bad-chain", [desc(0x4_0000, 16, 0, 0), desc(0x1_0000, len(GETATTR), NEXT, 2), desc(0x1_1000, 0x1000, WRITE, 0)], [0, 1], GETATTR)
+worker_seed("request-in-hole", [desc(0x4_0000, 40, NEXT, 1), desc(0x1_1000, 0x1000, WRITE, 0)], [0])
+worker_seed("reply-in-hole", [desc(0x1_0000, len(INIT), NEXT, 1), desc(0x4_0000, 0x1000, WRITE, 0)], [0], INIT)
+worker_seed("request-past-memory", [desc(0xffff_ffff_ffff_f000, 40, NEXT, 1), desc(0x1_1000, 0x1000, WRITE, 0)], [0])
+worker_seed("reply-crosses-end-of-region", [desc(0x1_0000, len(INIT), NEXT, 1), desc(0x3_f000, 0x2000, WRITE, 0)], [0], INIT)
+worker_seed("length-crosses-hole", [desc(0x3_ff00, 0x400, 0, 0)], [0])
+worker_seed("write-only-chain", [desc(0x1_1000, 0x1000, WRITE, 0)], [0])
+worker_seed("loop-on-itself", [desc(0x1_0000, 16, NEXT, 0)], [0])
+worker_seed("two-bad-then-good", [desc(0x4_0000, 8, 0, 0), desc(0x4_0000, 8, 0, 0), desc(0x1_0000, len(INIT), NEXT, 3), desc(0x1_1000, 0x1000, WRITE, 0)], [0, 1, 2], INIT)
+worker_seed("empty", [], [])
+worker_seed("queue-size-one", [desc(0x4_0000, 16, 0, 0)], [0], size_sel=0)

@@ -1234,12 +1234,12 @@ impl FileSystem for PassthroughFs {
         debug!("read: {inode:?}");
         if inode == self.init_inode {
             let off: usize = offset.try_into().map_err(|_| einval())?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
+            // A read at or past the end is end of file, as on Windows; it must not underflow.
+            if off >= INIT_BINARY.len() {
+                return Ok(0);
+            }
+            let len = (size as usize).min(INIT_BINARY.len() - off);
+            return w.write(&INIT_BINARY[off..off + len]);
         }
 
         let data = self

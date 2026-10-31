@@ -229,5 +229,21 @@ pub fn fuse_worker(data: &[u8]) {
         0,
     );
     let _ = evts[1].write(1);
-    worker.handle_event_for_fuzz(1);
+    // A worker that never returns is a finding too (a head `pop` refuses must not spin it): wait
+    // for it on a thread, as the VMM runs it, and give up after a generous bound.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        worker.handle_event_for_fuzz(1);
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the FUSE worker did not return from one queue event within 10 s")
+        }
+        // The thread ended without sending: it panicked, and its message is already printed.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the FUSE worker thread panicked")
+        }
+    }
 }

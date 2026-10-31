@@ -20,6 +20,11 @@ input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
+fuzzing = ["test_utils"]
+
+[[test]]
+name = "fuzz_corpus"
+required-features = ["fuzzing"]
 
 [dependencies]
 bincode = { version = "2.0.1", features = ["serde"] }

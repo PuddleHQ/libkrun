@@ -3,6 +3,8 @@ pub mod dyn_filesystem;
 #[allow(dead_code)]
 pub mod filesystem;
 pub mod fuse;
+#[cfg(all(feature = "fuzzing", target_os = "linux"))]
+pub mod fuzzing;
 #[allow(dead_code)]
 mod multikey;
 #[cfg_attr(target_os = "windows", allow(dead_code))]

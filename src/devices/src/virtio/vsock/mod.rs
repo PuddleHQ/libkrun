@@ -23,6 +23,8 @@ mod muxer_thread;
 #[path = "muxer_thread_windows.rs"]
 mod muxer_thread;
 #[allow(dead_code)]
+#[cfg(all(feature = "fuzzing", unix))]
+pub use self::muxer::fuzzing;
 mod packet;
 mod proxy;
 mod reaper;

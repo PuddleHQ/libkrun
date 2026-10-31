@@ -20,6 +20,14 @@ mod bus;
 ))]
 pub mod fdt;
 pub mod legacy;
+#[cfg(feature = "fuzzing")]
+pub use virtio::balloon::fuzzing::balloon_queues;
+#[cfg(all(feature = "fuzzing", target_os = "linux"))]
+pub use virtio::fs::fuzzing::fuse_requests;
+#[cfg(feature = "fuzzing")]
+pub use virtio::fuzzing::{guest_memory, virtqueue_chain};
+#[cfg(feature = "fuzzing")]
+pub use virtio::vsock::fuzzing::vsock_packets;
 pub mod virtio;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;

@@ -1,0 +1,44 @@
+[package]
+name = "msb_krun_devices-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+msb_krun_devices = { path = "../src/devices", features = ["fuzzing"] }
+
+# Standalone workspace: the fuzz crate needs nightly and libFuzzer instrumentation and must never
+# affect the libkrun workspace build.
+[workspace]
+
+[[bin]]
+name = "virtqueue_chain"
+path = "fuzz_targets/virtqueue_chain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vsock_packets"
+path = "fuzz_targets/vsock_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "balloon_queues"
+path = "fuzz_targets/balloon_queues.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuse_requests"
+path = "fuzz_targets/fuse_requests.rs"
+test = false
+doc = false
+bench = false

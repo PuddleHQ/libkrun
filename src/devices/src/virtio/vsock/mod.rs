@@ -95,9 +95,11 @@ mod defs {
     /// Size of the muxer RX packet queue.
     pub const MUXER_RXQ_SIZE: usize = 256;
 
-    // Kernel side doesn't play nice with us supporting so many bytes
-    //pub const CONN_TX_BUF_SIZE: usize = i32::MAX as usize;
-    pub const CONN_TX_BUF_SIZE: usize = 8 * 1024 * 1024;
+    /// Bytes a guest may have in flight to the host on one connection, and the most the host
+    /// holds for it when its peer reads slowly. A guest that writes and never reads costs the
+    /// host this much per connection; 2 MiB keeps one connection at line rate (measured on a
+    /// real VM) and bounds a route at `MAX_ACTIVE_PEERS` times this.
+    pub const CONN_TX_BUF_SIZE: usize = 2 * 1024 * 1024;
     #[cfg(unix)]
     pub const SOCK_STREAM: u16 = 1;
     #[cfg(unix)]

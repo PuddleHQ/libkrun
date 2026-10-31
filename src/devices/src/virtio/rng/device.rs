@@ -1,6 +1,6 @@
 use rand::{rngs::OsRng, TryRngCore};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
@@ -8,6 +8,12 @@ use super::super::{
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+
+/// The most random bytes one request gets. The guest picks the descriptor lengths (up to 4 GiB
+/// each), and this keeps a request from holding the device thread. Linux's hw_random reads a few
+/// hundred bytes at a time.
+pub(crate) const MAX_REQUEST_BYTES: u32 = 64 * 1024;
+const CHUNK_BYTES: u32 = 4096;
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
@@ -59,19 +65,35 @@ impl Rng {
         while let Some(head) = queues[REQ_INDEX].queue.pop(mem) {
             let index = head.index;
             let mut written = 0;
-            for desc in head.into_iter() {
-                let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
-                    error!("Failed to fill buffer with random data: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
-                    break;
+            'descs: for desc in head.into_iter() {
+                // Stream each descriptor through a small buffer so a guest-chosen length never
+                // sets the size of a host allocation, and stop at the per-request cap.
+                let mut done = 0u32;
+                while done < desc.len {
+                    let left = MAX_REQUEST_BYTES.saturating_sub(written);
+                    if left == 0 {
+                        debug!("rng: request capped at {MAX_REQUEST_BYTES} bytes");
+                        break 'descs;
+                    }
+                    let n = (desc.len - done).min(left).min(CHUNK_BYTES);
+                    let mut rand_bytes = [0u8; CHUNK_BYTES as usize];
+                    let rand_bytes = &mut rand_bytes[..n as usize];
+                    if let Err(e) = OsRng.try_fill_bytes(rand_bytes) {
+                        error!("Failed to fill buffer with random data: {e:?}");
+                        queues[REQ_INDEX].queue.go_to_previous_position();
+                        break 'descs;
+                    }
+                    let Some(addr) = desc.addr.checked_add(u64::from(done)) else {
+                        break 'descs;
+                    };
+                    if let Err(e) = mem.write_slice(rand_bytes, addr) {
+                        error!("Failed to write slice: {e:?}");
+                        queues[REQ_INDEX].queue.go_to_previous_position();
+                        break 'descs;
+                    }
+                    done += n;
+                    written += n;
                 }
-                if let Err(e) = mem.write_slice(&rand_bytes[..], desc.addr) {
-                    error!("Failed to write slice: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
-                    break;
-                }
-                written += desc.len;
             }
 
             have_used = true;
@@ -178,5 +200,78 @@ impl VirtioDevice for Rng {
             ))?;
         self.device_state = DeviceState::Inactive;
         Ok(queues)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use utils::eventfd::EventFd;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+
+    const BUF: u64 = 0x10000;
+    /// The documented cap, written out so that changing the constant fails these tests.
+    const CAP: u32 = 64 * 1024;
+
+    /// An activated rng whose request queue holds one write-only descriptor of `len` bytes at
+    /// `BUF`, the way a guest driver posts a buffer.
+    fn rng_with_request(mem: &GuestMemoryMmap, len: u32) -> (Rng, VirtQueue<'_>) {
+        let vq = VirtQueue::new(GuestAddress(0), mem, 16);
+        vq.dtable[0].set(BUF, len, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let mut rng = Rng::new().unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-rng".into()).unwrap();
+        let queue = DeviceQueue::new(vq.create_queue(), Arc::new(EventFd::new(0).unwrap()));
+        rng.activate(mem.clone(), interrupt, vec![queue]).unwrap();
+        (rng, vq)
+    }
+
+    fn mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40_0000)]).unwrap()
+    }
+
+    #[test]
+    fn a_request_far_past_the_cap_gets_only_the_cap() {
+        let mem = mem();
+        // 2 MiB asked for, 64 KiB capped: the reply says how much was written.
+        let (mut rng, vq) = rng_with_request(&mem, 2 << 20);
+        assert!(rng.process_req());
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().len, CAP);
+        let mut tail = [0u8; 16];
+        mem.read_slice(&mut tail, GuestAddress(BUF + u64::from(CAP)))
+            .unwrap();
+        assert_eq!(tail, [0u8; 16], "nothing may be written past the cap");
+    }
+
+    #[test]
+    fn a_four_gib_descriptor_neither_allocates_nor_fails_the_device() {
+        let mem = mem();
+        let (mut rng, vq) = rng_with_request(&mem, u32::MAX);
+        assert!(rng.process_req());
+        assert_eq!(vq.used.ring[0].get().len, CAP);
+    }
+
+    #[test]
+    fn a_normal_request_is_filled_whole() {
+        let mem = mem();
+        let (mut rng, vq) = rng_with_request(&mem, 6000);
+        assert!(rng.process_req());
+        assert_eq!(vq.used.ring[0].get().len, 6000);
+        let mut got = vec![0u8; 6000];
+        mem.read_slice(&mut got, GuestAddress(BUF)).unwrap();
+        assert!(got.iter().any(|b| *b != 0));
+        assert!(
+            got[4096..].iter().any(|b| *b != 0),
+            "the second chunk is filled too"
+        );
     }
 }

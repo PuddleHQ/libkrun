@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use vm_memory::{Bytes, GuestAddress};
 
+use super::dyn_filesystem::DynFileSystemAdapter;
+use super::filesystem::FileSystem;
 use super::fuse::{InHeader, InitInCompat, Opcode};
 use super::passthrough::{Config, PassthroughFs};
 use super::server::Server;
@@ -62,8 +64,8 @@ impl Drop for Tree {
     }
 }
 
-fn dispatch(
-    server: &Server<PassthroughFs>,
+fn dispatch<F: FileSystem + Sync>(
+    server: &Server<F>,
     mem: &vm_memory::GuestMemoryMmap,
     request: &[u8],
     reply_len: u32,
@@ -109,7 +111,30 @@ pub fn fuse_requests(data: &[u8]) {
         ..Config::default()
     };
     let fs = PassthroughFs::new(cfg).expect("passthrough over the served tree");
-    let server = Server::new(Arc::new(fs), 0);
+    fuse_session(Arc::new(fs), data);
+}
+
+/// The same requests against a backend the caller supplies, wrapped the way the VMM wraps a
+/// `DynFileSystem`. The caller owns whatever the backend serves (see `served_tree`).
+pub fn fuse_dyn_session(fs: Arc<dyn super::dyn_filesystem::DynFileSystem>, data: &[u8]) {
+    fuse_session(Arc::new(DynFileSystemAdapter::new(fs)), data);
+}
+
+/// A fresh small tree for a backend to serve, removed when the returned guard drops. Also caps
+/// what the requests may write on the host (see `limit_host_writes`).
+pub fn served_tree() -> impl AsRef<std::path::Path> {
+    limit_host_writes();
+    Tree::new()
+}
+
+impl AsRef<std::path::Path> for Tree {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+fn fuse_session<F: FileSystem + Sync>(fs: Arc<F>, data: &[u8]) {
+    let server = Server::new(fs, 0);
     let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEMORY)])
         .expect("anonymous region");
 

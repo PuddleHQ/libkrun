@@ -1,0 +1,48 @@
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 548900423
+INFO: Loaded 1 modules   (789 inline 8-bit counters): 789 [0x617a6cc549d0, 0x617a6cc54ce5), 
+INFO: Loaded 1 PC tables (789 PCs): 789 [0x617a6cc54ce8,0x617a6cc57e38), 
+INFO:       40 files found in ../../work-corpus/vsock_tsi
+INFO:       17 files found in corpus/vsock_tsi
+INFO: seed corpus: files: 57 min: 1b max: 272b total: 1724b rss: 33Mb
+#58	INITED cov: 130 ft: 235 corp: 33/1329b exec/s: 0 rss: 36Mb
+#8284	REDUCE cov: 130 ft: 235 corp: 33/1327b lim: 352 exec/s: 0 rss: 43Mb L: 10/272 MS: 1 EraseBytes-
+#70722	REDUCE cov: 130 ft: 235 corp: 33/1311b lim: 971 exec/s: 0 rss: 55Mb L: 248/272 MS: 3 CMP-ChangeBinInt-EraseBytes- DE: "\230\000"-
+#71241	REDUCE cov: 130 ft: 235 corp: 33/1282b lim: 971 exec/s: 0 rss: 55Mb L: 219/272 MS: 4 InsertRepeatedBytes-ChangeByte-ShuffleBytes-EraseBytes-
+#71972	REDUCE cov: 130 ft: 235 corp: 33/1271b lim: 971 exec/s: 0 rss: 56Mb L: 208/272 MS: 1 EraseBytes-
+#72703	REDUCE cov: 130 ft: 235 corp: 33/1259b lim: 971 exec/s: 0 rss: 56Mb L: 196/272 MS: 1 EraseBytes-
+#73022	REDUCE cov: 130 ft: 235 corp: 33/1234b lim: 971 exec/s: 0 rss: 56Mb L: 171/272 MS: 4 ShuffleBytes-ChangeBinInt-InsertRepeatedBytes-EraseBytes-
+#74839	REDUCE cov: 130 ft: 235 corp: 33/1227b lim: 989 exec/s: 0 rss: 56Mb L: 164/272 MS: 2 ChangeByte-EraseBytes-
+#105659	REDUCE cov: 130 ft: 235 corp: 33/1223b lim: 1295 exec/s: 105659 rss: 62Mb L: 160/272 MS: 5 PersAutoDict-CrossOver-ShuffleBytes-ShuffleBytes-EraseBytes- DE: "\230\000"-
+#262144	pulse  cov: 130 ft: 235 corp: 33/1223b lim: 2847 exec/s: 87381 rss: 91Mb
+#524288	pulse  cov: 130 ft: 235 corp: 33/1223b lim: 5457 exec/s: 87381 rss: 140Mb
+#1048576	pulse  cov: 130 ft: 235 corp: 33/1223b lim: 10676 exec/s: 87381 rss: 236Mb
+#2097152	pulse  cov: 130 ft: 235 corp: 33/1223b lim: 16384 exec/s: 87381 rss: 431Mb
+#2382621	REDUCE cov: 130 ft: 235 corp: 33/1219b lim: 16384 exec/s: 88245 rss: 485Mb L: 268/268 MS: 2 PersAutoDict-EraseBytes- DE: "\230\000"-
+#2387532	REDUCE cov: 130 ft: 235 corp: 33/1215b lim: 16384 exec/s: 88427 rss: 486Mb L: 264/264 MS: 1 EraseBytes-
+#2620954	REDUCE cov: 130 ft: 235 corp: 33/1195b lim: 16384 exec/s: 87365 rss: 489Mb L: 149/264 MS: 5 InsertRepeatedBytes-ChangeBinInt-EraseBytes-CrossOver-ChangeBit-
+#2630536	REDUCE cov: 130 ft: 235 corp: 33/1192b lim: 16384 exec/s: 87684 rss: 490Mb L: 146/264 MS: 2 ShuffleBytes-EraseBytes-
+#3184155	REDUCE cov: 130 ft: 235 corp: 33/1175b lim: 16384 exec/s: 88448 rss: 492Mb L: 247/247 MS: 2 EraseBytes-PersAutoDict- DE: "\230\000"-
+#3191039	REDUCE cov: 130 ft: 235 corp: 33/1130b lim: 16384 exec/s: 86244 rss: 492Mb L: 202/202 MS: 3 CopyPart-CMP-EraseBytes- DE: "f\001\000\000\000\000\000\000"-
+#3193782	REDUCE cov: 130 ft: 235 corp: 33/1121b lim: 16384 exec/s: 86318 rss: 492Mb L: 193/193 MS: 3 ShuffleBytes-InsertByte-EraseBytes-
+#3198846	REDUCE cov: 130 ft: 235 corp: 33/1103b lim: 16384 exec/s: 86455 rss: 492Mb L: 175/175 MS: 4 CopyPart-InsertRepeatedBytes-ShuffleBytes-EraseBytes-
+#3205423	REDUCE cov: 130 ft: 235 corp: 33/1097b lim: 16384 exec/s: 86633 rss: 492Mb L: 169/169 MS: 2 EraseBytes-PersAutoDict- DE: "\230\000"-
+#3233849	REDUCE cov: 130 ft: 235 corp: 33/1096b lim: 16384 exec/s: 87401 rss: 492Mb L: 168/168 MS: 1 EraseBytes-
+#3570829	REDUCE cov: 130 ft: 235 corp: 33/1081b lim: 16384 exec/s: 87093 rss: 494Mb L: 145/168 MS: 5 CrossOver-EraseBytes-ChangeBinInt-CopyPart-ChangeBit-
+#3574147	REDUCE cov: 130 ft: 235 corp: 33/1080b lim: 16384 exec/s: 87174 rss: 494Mb L: 144/168 MS: 3 ChangeByte-ChangeBinInt-EraseBytes-
+#4194304	pulse  cov: 130 ft: 235 corp: 33/1080b lim: 16384 exec/s: 87381 rss: 497Mb
+#8198947	REDUCE cov: 130 ft: 235 corp: 33/1077b lim: 16384 exec/s: 87222 rss: 500Mb L: 165/165 MS: 4 PersAutoDict-ChangeBit-ChangeByte-EraseBytes- DE: "\230\000"-
+#8202455	REDUCE cov: 130 ft: 235 corp: 33/1073b lim: 16384 exec/s: 87260 rss: 500Mb L: 161/161 MS: 3 CrossOver-InsertByte-EraseBytes-
+#8273321	REDUCE cov: 130 ft: 235 corp: 33/1072b lim: 16384 exec/s: 87087 rss: 500Mb L: 160/160 MS: 4 PersAutoDict-InsertRepeatedBytes-EraseBytes-CrossOver- DE: "f\001\000\000\000\000\000\000"-
+#8388608	pulse  cov: 130 ft: 235 corp: 33/1072b lim: 16384 exec/s: 87381 rss: 500Mb
+#10545248	DONE   cov: 130 ft: 235 corp: 33/1072b lim: 16384 exec/s: 87150 rss: 500Mb
+###### Recommended dictionary. ######
+"\230\000" # Uses: 642090
+"f\001\000\000\000\000\000\000" # Uses: 343229
+###### End of recommended dictionary. ######
+Done 10545248 runs in 121 second(s)
+stat::number_of_executed_units: 10545248
+stat::average_exec_per_sec:     87150
+stat::new_units_added:          23
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              500

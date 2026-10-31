@@ -11,6 +11,8 @@ driver would and runs the device's own handler.
 | `vsock_packets` | guest packets (header, payload, chain shape) into the muxer's stream and datagram paths and its RX side |
 | `balloon_queues` | all five balloon queues: free page reports, stats buffers, kicks on the unused queues |
 | `fuse_requests` | FUSE requests into the dispatcher over the Linux passthrough backend on a small tree |
+| `fuse_worker` | the FUSE worker over a guest-laid-out queue (ring memory and request memory), one kick; fails if the worker panics or does not return within 10 s |
+| `vsock_tsi` | the TSI request parsers over one buffer that ends at an inaccessible page (the muxer's TSI handlers open host sockets, so the target stops at the parsers) |
 
 Seed inputs under `corpus/<target>/` are made by `gen_seeds.py` and checked in; each name says
 what the input is. `src/devices/tests/fuzz_corpus.rs` replays every file on stable:
@@ -52,3 +54,13 @@ Until then run the targets by hand as above.
 
 - `fuse_requests`: a guest read of the virtual init file at or past its end underflowed in the
   Linux passthrough backend (`init-inode-read-past-end`); fixed.
+- `fuse_worker`: the worker unwrapped `Reader::new`, `Writer::new` and the notification calls, so
+  a descriptor outside guest memory panicked its thread; and a head `pop` refused (an index past
+  the queue size) made it spin forever, because `pop` leaves such a head in place. Both fixed
+  (`avail-head-refused-by-pop`, `avail-idx-far-ahead-of-queue`, the `*-in-hole` seeds). The
+  notification-call unwraps cannot fail on a validated ring; they are changed by reading.
+- `vsock_tsi`: the parsers indexed past short requests, trusted a guest `addr_len` and read a
+  path without a NUL past the buffer; fixed (`connect-four-bytes`, `unix-path-no-nul` and the
+  others named for the case). TSI is off unless the VMM enables it.
+- `get_extensions` split a FUSE extension longer than its request body. Linux backends never
+  negotiate the security context, so no target reaches it; a unit test in `fs/server.rs` pins it.

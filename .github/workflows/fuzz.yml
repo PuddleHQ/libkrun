@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [virtqueue_chain, vsock_packets, balloon_queues, fuse_requests]
+        target: [virtqueue_chain, vsock_packets, balloon_queues, fuse_requests, fuse_worker, vsock_tsi]
     steps:
       - uses: actions/checkout@v4
       - name: Nightly toolchain

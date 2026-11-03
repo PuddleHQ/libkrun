@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
@@ -57,6 +57,9 @@ pub struct TsiStreamProxy {
     peer_fwd_cnt: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
+    /// Guest bytes the socket has not taken yet. They are already in the guest's credit window,
+    /// so they stay here until the socket is writable; `tx_cnt` counts only what was forwarded.
+    pending_tx: VecDeque<u8>,
     unixsock_path: Option<PathBuf>,
 }
 
@@ -137,6 +140,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            pending_tx: VecDeque::new(),
             unixsock_path: None,
         })
     }
@@ -175,6 +179,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            pending_tx: VecDeque::new(),
             unixsock_path: None,
         }
     }
@@ -404,6 +409,83 @@ impl TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
+    /// Send `buf` until it is gone, the socket would block or it fails. Returns how many bytes
+    /// went out and why it stopped early, if it did. Only forwarded bytes enter `tx_cnt`.
+    fn send_all(&mut self, buf: &[u8]) -> (usize, Option<Errno>) {
+        #[cfg(target_os = "macos")]
+        let flags = MsgFlags::empty();
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_NOSIGNAL;
+
+        let mut sent = 0;
+        while sent < buf.len() {
+            match send(self.fd.as_raw_fd(), &buf[sent..], flags) {
+                Ok(0) => return (sent, Some(Errno::EPIPE)),
+                Ok(n) => {
+                    sent += n;
+                    self.tx_cnt += Wrapping(n as u32);
+                }
+                Err(Errno::EINTR) => {}
+                Err(err) => return (sent, Some(err)),
+            }
+        }
+        (sent, None)
+    }
+
+    /// Write out what an earlier `sendmsg` could not. A real error drops the rest: the
+    /// connection is dead and its HANG_UP resets the guest side.
+    fn flush_pending_tx(&mut self) -> Result<(), Errno> {
+        while !self.pending_tx.is_empty() {
+            let chunk = self.pending_tx.make_contiguous().to_vec();
+            let (sent, err) = self.send_all(&chunk);
+            self.pending_tx.drain(..sent);
+            match err {
+                None => {}
+                Some(Errno::EAGAIN) => return Ok(()),
+                Some(err) => {
+                    self.pending_tx.clear();
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn polling_events(&self) -> EventSet {
+        let mut events = if self.status == ProxyStatus::WaitingCreditUpdate {
+            EventSet::empty()
+        } else {
+            EventSet::IN
+        };
+        if !self.pending_tx.is_empty() {
+            events |= EventSet::OUT;
+        }
+        events
+    }
+
+    fn maybe_push_credit_update(
+        &mut self,
+        local_port: u32,
+        peer_port: u32,
+        update: &mut ProxyUpdate,
+    ) {
+        if (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= (defs::CONN_TX_BUF_SIZE / 2) {
+            debug!(
+                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
+                self.id, self.tx_cnt, self.last_tx_cnt_sent
+            );
+            self.last_tx_cnt_sent = self.tx_cnt;
+            // This packet goes to the connection.
+            let rx = MuxerRx::CreditUpdate {
+                local_port,
+                peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            update.signal_queue = true;
+        }
+    }
+
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
         match fcntl(&self.fd, FcntlArg::F_GETFL) {
@@ -590,21 +672,35 @@ impl Proxy for TsiStreamProxy {
         debug!("sendmsg");
 
         let mut update = ProxyUpdate::default();
+        let had_pending = !self.pending_tx.is_empty();
 
         let ret = if let Some(buf) = pkt.tx_data() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
-            #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
-
-            match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
+            // Older bytes go first: a stream must not reorder.
+            let mut result = self.flush_pending_tx();
+            if result.is_ok() {
+                if self.pending_tx.is_empty() {
+                    let (sent, err) = self.send_all(buf);
+                    match err {
+                        None => {}
+                        Some(Errno::EAGAIN) => self.pending_tx.extend(&buf[sent..]),
+                        Some(err) => {
+                            if sent < buf.len() {
+                                error!("send failed: buf={}, sent={}, err={err}", buf.len(), sent);
+                            }
+                            result = Err(err);
+                        }
                     }
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
+                    // A failure after some bytes went out still counts as progress; the dead
+                    // connection reports itself with a HANG_UP.
+                    if sent > 0 {
+                        result = Ok(());
+                    }
+                } else {
+                    self.pending_tx.extend(buf);
                 }
+            }
+            match result {
+                Ok(()) => buf.len() as i32,
                 Err(err) => {
                     #[cfg(target_os = "macos")]
                     let errno = -linux_errno_raw(err as i32);
@@ -617,22 +713,11 @@ impl Proxy for TsiStreamProxy {
             -libc::EINVAL
         };
 
-        if ret > 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= (defs::CONN_TX_BUF_SIZE / 2)
-        {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-            // This packet goes to the connection.
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            update.signal_queue = true;
+        if ret > 0 {
+            self.maybe_push_credit_update(pkt.dst_port(), pkt.src_port(), &mut update);
+        }
+        if had_pending != !self.pending_tx.is_empty() {
+            update.polling = Some((self.id, self.fd.as_raw_fd(), self.polling_events()));
         }
 
         debug!("sendmsg ret={ret}");
@@ -706,7 +791,7 @@ impl Proxy for TsiStreamProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, self.fd.as_raw_fd(), self.polling_events())),
             ..Default::default()
         }
     }
@@ -853,7 +938,7 @@ impl Proxy for TsiStreamProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((self.id(), self.fd.as_raw_fd(), self.polling_events()));
                 }
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
@@ -883,6 +968,16 @@ impl Proxy for TsiStreamProxy {
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+            } else if !self.pending_tx.is_empty() {
+                if self.flush_pending_tx().is_err() {
+                    debug!(
+                        "process_event: send failed, waiting for HANG_UP: id={}",
+                        self.id
+                    );
+                }
+                self.maybe_push_credit_update(self.local_port, self.peer_port, &mut update);
+                update.signal_queue = true;
+                update.polling = Some((self.id, self.fd.as_raw_fd(), self.polling_events()));
             } else {
                 debug!("EventSet::OUT while not connecting");
             }
@@ -942,5 +1037,120 @@ mod tests {
         let mut got = Vec::new();
         std::io::Read::read_to_end(&mut guest_view, &mut got).unwrap();
         assert_eq!(got, b"a");
+    }
+
+    /// A nonblocking socket that takes only part of a write: the tail must wait for the socket to
+    /// become writable and arrive in order, and credit must count only what was forwarded.
+    #[test]
+    fn sendmsg_keeps_the_tail_a_short_send_leaves() {
+        use nix::sys::socket::{setsockopt, sockopt};
+        use std::io::Read;
+
+        const LEN: usize = 32 * 1024;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = TsiStreamProxy::new(
+            1,
+            3,
+            defs::LINUX_AF_INET,
+            5000,
+            4000,
+            1234,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap();
+        let (host, mut guest_view) = UnixStream::pair().unwrap();
+        setsockopt(&host, sockopt::SndBuf, &4096).unwrap();
+        host.set_nonblocking(true).unwrap();
+        guest_view.set_nonblocking(true).unwrap();
+        proxy.fd = host.into();
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let pkt = tx_packet(&mem, LEN as u32, &payload);
+
+        let update = proxy.sendmsg(&pkt);
+
+        assert!(
+            (proxy.tx_cnt.0 as usize) < LEN,
+            "the socket must have refused part of the write for this test to mean anything"
+        );
+        assert_eq!(proxy.tx_cnt.0 as usize, LEN - proxy.pending_tx.len());
+        assert_eq!(
+            update.polling.map(|p| p.2),
+            Some(EventSet::IN | EventSet::OUT),
+            "a stalled tail needs a writable wakeup"
+        );
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        for _ in 0..1000 {
+            loop {
+                match guest_view.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            if got.len() == LEN {
+                break;
+            }
+            proxy.process_event(EventSet::OUT);
+        }
+
+        assert_eq!(got, payload);
+        assert_eq!(proxy.tx_cnt.0 as usize, LEN);
+        assert!(proxy.pending_tx.is_empty());
+    }
+
+    /// A packet that arrives while an earlier tail is still waiting queues behind it.
+    #[test]
+    fn sendmsg_queues_behind_a_waiting_tail() {
+        use nix::sys::socket::{setsockopt, sockopt};
+        use std::io::Read;
+
+        const LEN: usize = 32 * 1024;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = TsiStreamProxy::new(
+            1,
+            3,
+            defs::LINUX_AF_INET,
+            5000,
+            4000,
+            1234,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap();
+        let (host, mut guest_view) = UnixStream::pair().unwrap();
+        setsockopt(&host, sockopt::SndBuf, &4096).unwrap();
+        host.set_nonblocking(true).unwrap();
+        guest_view.set_nonblocking(true).unwrap();
+        proxy.fd = host.into();
+        let first = vec![b'a'; LEN];
+        proxy.sendmsg(&tx_packet(&mem, LEN as u32, &first));
+        assert!(!proxy.pending_tx.is_empty());
+        proxy.sendmsg(&tx_packet(&mem, 3, b"zzz"));
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        for _ in 0..1000 {
+            loop {
+                match guest_view.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            if got.len() == LEN + 3 {
+                break;
+            }
+            proxy.process_event(EventSet::OUT);
+        }
+        assert_eq!(&got[..LEN], &first[..]);
+        assert_eq!(&got[LEN..], b"zzz");
+        assert!(proxy.pending_tx.is_empty());
     }
 }

@@ -591,7 +591,7 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.tx_data() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
@@ -903,5 +903,44 @@ impl Drop for TsiStreamProxy {
         if let Some(path) = &self.unixsock_path {
             _ = fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use super::super::packet::test_util::tx_packet;
+    use super::*;
+
+    /// The guest declares 1 byte but its descriptor holds more: only the declared byte may reach
+    /// the host socket, and the credit count must match it.
+    #[test]
+    fn sendmsg_sends_only_the_declared_length() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = TsiStreamProxy::new(
+            1,
+            3,
+            defs::LINUX_AF_INET,
+            5000,
+            4000,
+            1234,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap();
+        let (host, mut guest_view) = UnixStream::pair().unwrap();
+        proxy.fd = host.into();
+        let pkt = tx_packet(&mem, 1, b"a-secret-tail");
+
+        proxy.sendmsg(&pkt);
+
+        drop(proxy);
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut guest_view, &mut got).unwrap();
+        assert_eq!(got, b"a");
     }
 }

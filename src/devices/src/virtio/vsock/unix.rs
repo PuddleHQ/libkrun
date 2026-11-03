@@ -526,7 +526,7 @@ impl Proxy for UnixProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.tx_data() {
             // Credit is returned when bytes enter this bounded proxy queue;
             // readiness drives later partial flushes without blocking a VMM thread.
             self.pending_write.extend(buf);
@@ -907,5 +907,35 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use super::super::packet::test_util::tx_packet;
+    use super::*;
+
+    /// Bytes queued for the host socket and counted as credit are the declared length.
+    #[test]
+    fn sendmsg_queues_only_the_declared_length() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = UnixProxy::new(
+            1,
+            3,
+            5000,
+            1234,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+            PathBuf::from("/nonexistent/krun-t954"),
+        )
+        .unwrap();
+        let pkt = tx_packet(&mem, 1, b"a-secret-tail");
+
+        proxy.sendmsg(&pkt);
+
+        assert_eq!(proxy.tx_cnt.0, 1);
     }
 }

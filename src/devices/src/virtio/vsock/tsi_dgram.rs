@@ -314,7 +314,7 @@ impl Proxy for TsiDgramProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         debug!("sendmsg");
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.tx_data() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
@@ -362,7 +362,7 @@ impl Proxy for TsiDgramProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         if let Some(addr) = self.sendto_addr {
-            if let Some(buf) = pkt.buf() {
+            if let Some(buf) = pkt.tx_data() {
                 #[cfg(target_os = "macos")]
                 let flags = MsgFlags::empty();
                 #[cfg(target_os = "linux")]
@@ -471,5 +471,64 @@ impl Proxy for TsiDgramProxy {
 impl AsRawFd for TsiDgramProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixDatagram;
+
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use super::super::packet::test_util::tx_packet;
+    use super::*;
+
+    fn proxy(mem: &GuestMemoryMmap) -> TsiDgramProxy {
+        TsiDgramProxy::new(
+            1,
+            3,
+            defs::LINUX_AF_INET,
+            4000,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap()
+    }
+
+    /// A connected datagram must carry the declared length, not the whole descriptor.
+    #[test]
+    fn sendmsg_sends_only_the_declared_length() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = proxy(&mem);
+        let (host, peer) = UnixDatagram::pair().unwrap();
+        proxy.fd = host.into();
+        let pkt = tx_packet(&mem, 1, b"a-secret-tail");
+
+        proxy.sendmsg(&pkt);
+
+        let mut buf = [0u8; 64];
+        let n = peer.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"a");
+        assert_eq!(proxy.tx_cnt.0, 1);
+    }
+
+    /// The `sendto` path reads the same packet buffer.
+    #[test]
+    fn sendto_data_sends_only_the_declared_length() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = proxy(&mem);
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        proxy.sendto_addr = Some(SockaddrStorage::from(peer.local_addr().unwrap()));
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        proxy.fd = sender.into();
+        let pkt = tx_packet(&mem, 1, b"a-secret-tail");
+
+        proxy.sendto_data(&pkt);
+
+        let mut buf = [0u8; 64];
+        let n = peer.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"a");
+        assert_eq!(proxy.tx_cnt.0, 1);
     }
 }

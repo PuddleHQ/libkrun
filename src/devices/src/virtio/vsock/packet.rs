@@ -406,6 +406,13 @@ impl VsockPacket {
         self.buf()?.get(..len)
     }
 
+    /// The declared payload of a TX packet, or `None` when it carries no data. Proxies forward
+    /// this, never `buf()`: a guest may declare less than its descriptor holds, and the credit
+    /// the guest tracks counts the declared length.
+    pub(crate) fn tx_data(&self) -> Option<&[u8]> {
+        self.payload().filter(|data| !data.is_empty())
+    }
+
     /// Provides in-place, byte-slice, mutable access to the vsock packet data buffer.
     ///
     /// Note: control packets (e.g. connection request or reset) have no data buffer associated.
@@ -1144,5 +1151,54 @@ mod tests {
             VsockPacket::from_tx_virtq_head(&head),
             Err(VsockError::UnreadableDescriptor)
         ));
+    }
+}
+
+/// A TX packet builder shared by the proxy tests.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
+
+    /// Header descriptor plus one data descriptor holding all of `descriptor`, while the header
+    /// declares only `declared_len` bytes (a guest may declare less than the descriptor holds).
+    pub(crate) fn tx_packet(
+        mem: &GuestMemoryMmap,
+        declared_len: u32,
+        descriptor: &[u8],
+    ) -> VsockPacket {
+        const DESC_TABLE: u64 = 0x1000;
+        const HEADER: u64 = 0x2000;
+        const PAYLOAD: u64 = 0x3000;
+
+        mem.write_obj(
+            Descriptor {
+                addr: HEADER,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 1,
+                next: 1,
+            },
+            GuestAddress(DESC_TABLE),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: PAYLOAD,
+                len: descriptor.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(DESC_TABLE + 16),
+        )
+        .unwrap();
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[HDROFF_LEN..HDROFF_LEN + 4].copy_from_slice(&declared_len.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(HEADER)).unwrap();
+        mem.write_slice(descriptor, GuestAddress(PAYLOAD)).unwrap();
+
+        let head = DescriptorChain::checked_new(mem, GuestAddress(DESC_TABLE), 2, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head).unwrap()
     }
 }

@@ -320,11 +320,12 @@ impl Proxy for TsiDgramProxy {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
+            // A datagram socket takes the whole datagram or none, so there is no tail to keep.
+            // A refused datagram is dropped as UDP drops it, and its bytes still count as
+            // consumed: the guest charged them to its credit when it sent them.
+            self.tx_cnt += Wrapping(buf.len() as u32);
             match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
+                Ok(sent) => sent as i32,
                 Err(err) => -(err as i32),
             }
         } else {
@@ -361,21 +362,22 @@ impl Proxy for TsiDgramProxy {
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-        if let Some(addr) = self.sendto_addr {
-            if let Some(buf) = pkt.tx_data() {
-                #[cfg(target_os = "macos")]
-                let flags = MsgFlags::empty();
-                #[cfg(target_os = "linux")]
-                let flags = MsgFlags::MSG_NOSIGNAL;
+        // The datagram is consumed whether or not it can be sent: it is dropped as UDP drops it,
+        // and the guest has already charged its bytes to its credit.
+        let Some(buf) = pkt.tx_data() else {
+            debug!("sendto_data pkt without buffer");
+            return;
+        };
+        self.tx_cnt += Wrapping(buf.len() as u32);
 
-                match sendto(self.fd.as_raw_fd(), buf, &addr, flags) {
-                    Ok(sent) => {
-                        self.tx_cnt += Wrapping(sent as u32);
-                    }
-                    Err(err) => debug!("error in sendto: {err}"),
-                }
-            } else {
-                debug!("sendto_data pkt without buffer");
+        if let Some(addr) = self.sendto_addr {
+            #[cfg(target_os = "macos")]
+            let flags = MsgFlags::empty();
+            #[cfg(target_os = "linux")]
+            let flags = MsgFlags::MSG_NOSIGNAL;
+
+            if let Err(err) = sendto(self.fd.as_raw_fd(), buf, &addr, flags) {
+                debug!("error in sendto: {err}");
             }
         } else {
             debug!("sendto_data without sendto_addr");
@@ -530,5 +532,44 @@ mod tests {
         let n = peer.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"a");
         assert_eq!(proxy.tx_cnt.0, 1);
+    }
+
+    /// A datagram socket takes a whole datagram or none, so a short write cannot happen. When the
+    /// socket refuses the datagram (full buffer), the guest's bytes are dropped as UDP would drop
+    /// them, and they must still count as consumed, or the credit the guest sees shrinks for good.
+    #[test]
+    fn sendmsg_counts_a_refused_datagram_as_consumed() {
+        use nix::sys::socket::{setsockopt, sockopt};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = proxy(&mem);
+        let (host, _peer) = UnixDatagram::pair().unwrap();
+        setsockopt(&host, sockopt::SndBuf, &4096).unwrap();
+        host.set_nonblocking(true).unwrap();
+        proxy.fd = host.into();
+        let payload = [7u8; 1024];
+        let mut sent = 0u32;
+        for _ in 0..200 {
+            proxy.sendmsg(&tx_packet(&mem, payload.len() as u32, &payload));
+            sent += payload.len() as u32;
+        }
+
+        assert_eq!(
+            proxy.tx_cnt.0, sent,
+            "every declared byte is consumed, delivered or not"
+        );
+    }
+
+    /// Same for the `sendto` path, which also drops a datagram when no address was set.
+    #[test]
+    fn sendto_data_counts_a_dropped_datagram_as_consumed() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = proxy(&mem);
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        proxy.fd = sender.into();
+
+        proxy.sendto_data(&tx_packet(&mem, 5, b"hello"));
+
+        assert_eq!(proxy.tx_cnt.0, 5);
     }
 }

@@ -48,6 +48,12 @@ pub struct UnixProxy {
     push_cnt: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
     pending_write: VecDeque<u8>,
+    /// A guest shutdown that arrived while `pending_write` still held bytes. Shutting the socket
+    /// down first would drop them, so it waits until they are out.
+    pending_shutdown: Option<Shutdown>,
+    /// The guest released the connection while `pending_write` still held bytes it was credited
+    /// for. The proxy stays, only to write them out, and is removed once they are gone.
+    guest_closed: bool,
 }
 
 enum StreamEndpoint {
@@ -164,6 +170,8 @@ impl UnixProxy {
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             pending_write: VecDeque::new(),
+            pending_shutdown: None,
+            guest_closed: false,
         })
     }
 
@@ -207,6 +215,8 @@ impl UnixProxy {
             push_cnt: Wrapping(0),
             path: Default::default(),
             pending_write: VecDeque::new(),
+            pending_shutdown: None,
+            guest_closed: false,
         }
     }
 
@@ -413,8 +423,23 @@ impl UnixProxy {
         Ok(())
     }
 
+    /// Shut the socket down once every accepted byte has been written to it.
+    fn apply_pending_shutdown(&mut self) {
+        if !self.pending_write.is_empty() {
+            return;
+        }
+        if let Some(how) = self.pending_shutdown.take() {
+            if let Err(e) = self.endpoint.shutdown(how) {
+                warn!("error sending shutdown to socket: {e}");
+            }
+        }
+    }
+
     fn connected_poll_events(&self) -> EventSet {
-        if self.pending_write.is_empty() {
+        if self.guest_closed {
+            // Nobody is left to read what the socket sends.
+            EventSet::OUT
+        } else if self.pending_write.is_empty() {
             EventSet::IN
         } else {
             EventSet::IN | EventSet::OUT
@@ -665,9 +690,20 @@ impl Proxy for UnixProxy {
             Shutdown::Write
         };
 
-        if let Err(e) = self.endpoint.shutdown(how) {
-            warn!("error sending shutdown to socket: {e}");
+        if how == Shutdown::Read {
+            // The write side stays open, so queued bytes are not at risk.
+            if let Err(e) = self.endpoint.shutdown(how) {
+                warn!("error sending shutdown to socket: {e}");
+            }
+            return;
         }
+        // The guest sends SHUTDOWN after its last data packet, but the socket may not have taken
+        // all of it yet. Keep the order: data first.
+        self.pending_shutdown = Some(match self.pending_shutdown {
+            Some(earlier) if earlier != how => Shutdown::Both,
+            _ => how,
+        });
+        self.apply_pending_shutdown();
     }
 
     fn release(&mut self) -> ProxyUpdate {
@@ -675,6 +711,23 @@ impl Proxy for UnixProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
+        if !self.pending_write.is_empty()
+            && matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            )
+        {
+            // Dropping the proxy now would close the socket with the tail unsent.
+            self.guest_closed = true;
+            return ProxyUpdate {
+                polling: Some((
+                    self.id,
+                    self.endpoint.as_raw_fd(),
+                    self.connected_poll_events(),
+                )),
+                ..Default::default()
+            };
+        }
         let remove_proxy = ProxyRemoval::Deferred;
 
         ProxyUpdate {
@@ -699,7 +752,7 @@ impl Proxy for UnixProxy {
             return update;
         }
 
-        if evset.contains(EventSet::IN) {
+        if evset.contains(EventSet::IN) && !self.guest_closed {
             debug!("process_event: IN");
             if self.status == ProxyStatus::Connected {
                 if !self.pending_write.is_empty() {
@@ -781,16 +834,26 @@ impl Proxy for UnixProxy {
             } else if self.status == ProxyStatus::Connected {
                 if let Err(err) = self.flush_pending_write() {
                     warn!("vsock backend write failed: {err}");
-                    self.push_reset();
+                    self.pending_write.clear();
+                    if !self.guest_closed {
+                        self.push_reset();
+                        update.signal_queue = true;
+                    }
                     self.status = ProxyStatus::Closed;
-                    update.signal_queue = true;
                     update.remove_proxy = ProxyRemoval::Deferred;
+                } else {
+                    self.apply_pending_shutdown();
+                    if self.guest_closed && self.pending_write.is_empty() {
+                        self.status = ProxyStatus::Closed;
+                        update.remove_proxy = ProxyRemoval::Deferred;
+                    }
                 }
-                update.polling = Some((
-                    self.id(),
-                    self.endpoint.as_raw_fd(),
-                    self.connected_poll_events(),
-                ));
+                let events = if self.status == ProxyStatus::Closed {
+                    EventSet::empty()
+                } else {
+                    self.connected_poll_events()
+                };
+                update.polling = Some((self.id(), self.endpoint.as_raw_fd(), events));
             } else {
                 error!("EventSet::OUT in unexpected state: {:?}", self.status);
             }
@@ -914,6 +977,7 @@ impl AsRawFd for UnixAcceptorProxy {
 mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
+    use super::super::defs::uapi;
     use super::super::packet::test_util::tx_packet;
     use super::*;
 
@@ -937,5 +1001,113 @@ mod tests {
         proxy.sendmsg(&pkt);
 
         assert_eq!(proxy.tx_cnt.0, 1);
+    }
+
+    /// A proxy in the connected state whose socket took only part of a 32 KiB write.
+    fn proxy_with_tail(
+        mem: &GuestMemoryMmap,
+    ) -> (UnixProxy, std::os::unix::net::UnixStream, Vec<u8>) {
+        use nix::sys::socket::{setsockopt, sockopt};
+
+        const LEN: usize = 32 * 1024;
+        let mut proxy = UnixProxy::new(
+            1,
+            3,
+            5000,
+            1234,
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+            PathBuf::from("/nonexistent/krun-t1052"),
+        )
+        .unwrap();
+        let (host, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        setsockopt(&host, sockopt::SndBuf, &4096).unwrap();
+        host.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        proxy.endpoint = StreamEndpoint::Unix(host.into());
+        proxy.status = ProxyStatus::Connected;
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        proxy.sendmsg(&tx_packet(mem, LEN as u32, &payload));
+        assert!(
+            !proxy.pending_write.is_empty(),
+            "the socket must refuse part of the write"
+        );
+        (proxy, peer, payload)
+    }
+
+    fn drain(
+        proxy: &mut UnixProxy,
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> (Vec<u8>, bool, ProxyUpdate) {
+        use std::io::Read;
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut last = ProxyUpdate::default();
+        for _ in 0..1000 {
+            loop {
+                match peer.read(&mut buf) {
+                    Ok(0) => return (got, true, last),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            if !proxy.pending_write.is_empty() {
+                last = proxy.process_event(EventSet::OUT);
+            }
+        }
+        (got, false, last)
+    }
+
+    fn shutdown_packet(mem: &GuestMemoryMmap, flags: u32) -> VsockPacket {
+        let mut pkt = tx_packet(mem, 0, b"");
+        pkt.set_flags(flags);
+        pkt
+    }
+
+    /// The short-write path already queues the tail; this pins that it arrives whole and in order.
+    #[test]
+    fn a_short_write_is_delivered_whole() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut proxy, mut peer, payload) = proxy_with_tail(&mem);
+        proxy.sendmsg(&tx_packet(&mem, 3, b"zzz"));
+
+        let (mut got, _, _) = drain(&mut proxy, &mut peer);
+        // Stop at the data: the peer is still open, so the drain ran out of rounds.
+        let mut expected = payload;
+        expected.extend_from_slice(b"zzz");
+        got.truncate(expected.len());
+
+        assert_eq!(got, expected);
+    }
+
+    /// SHUTDOWN follows the guest's last data packet; the tail still waiting for the socket must
+    /// go out before the socket is shut down.
+    #[test]
+    fn shutdown_waits_for_the_pending_tail() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut proxy, mut peer, payload) = proxy_with_tail(&mem);
+
+        proxy.shutdown(&shutdown_packet(&mem, uapi::VSOCK_FLAGS_SHUTDOWN_SEND));
+        let (got, eof, _) = drain(&mut proxy, &mut peer);
+
+        assert_eq!(got, payload);
+        assert!(eof, "the write side must be shut down once the tail is out");
+    }
+
+    /// A release while the tail waits keeps the proxy until the tail is out, then removes it.
+    #[test]
+    fn release_keeps_the_proxy_until_the_tail_is_out() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (mut proxy, mut peer, payload) = proxy_with_tail(&mem);
+
+        let update = proxy.release();
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        let (got, _, last) = drain(&mut proxy, &mut peer);
+
+        assert_eq!(got, payload);
+        assert!(matches!(last.remove_proxy, ProxyRemoval::Deferred));
     }
 }

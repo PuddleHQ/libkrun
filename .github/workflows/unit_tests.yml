@@ -111,6 +111,11 @@ jobs:
       - name: Windows block flush tests
         run: cargo test --locked --manifest-path src/devices/Cargo.toml --features blk guest_flush_persists
 
+      # A live grow resizes the image through Imago's handle; the raw handle must re-read its length
+      # or it refuses I/O into the grown range. The test writes and reads past the old end.
+      - name: Windows raw handle live grow test
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml --features blk raw_handle_accepts_io_past_the_old_length_after_growth
+
       - name: Windows device Clippy
         run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings
 

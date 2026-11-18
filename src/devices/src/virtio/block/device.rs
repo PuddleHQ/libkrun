@@ -1316,6 +1316,11 @@ impl Block {
             image.flush()?;
             image.sync()?;
         }
+        // The Windows raw handle caches the file length and refuses I/O past it.
+        #[cfg(windows)]
+        if let Some(raw_file) = &self.windows_raw_file {
+            raw_file.refresh_size()?;
+        }
         // Keep the drained DiskProperties (including writeback state and Windows handles).
         // Only the bounds change; rebuilding it would discard policy/accounting state.
         if let Some(disk) = self.disk.as_mut() {
@@ -1768,6 +1773,61 @@ mod tests {
         assert_eq!(actual, through_raw);
         reader.seek_read(&mut actual, 0x3000).unwrap();
         assert_eq!(actual, through_imago);
+
+        drop(reader);
+        drop(block);
+        std::fs::remove_file(image).unwrap();
+    }
+
+    // `grow_capacity` resizes the image through Imago's handle. The raw handle caches the file
+    // length, so it must learn the new one: a guest write past the old end is a legal request
+    // once the capacity has grown.
+    #[cfg(windows)]
+    #[test]
+    fn raw_handle_accepts_io_past_the_old_length_after_growth() {
+        let image = temp_image_path("grow-past-old-length");
+        let old_len = 1024 * 1024u64;
+        let file = File::create(&image).unwrap();
+        file.set_len(old_len).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "grow-past".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("grow-past".to_string()),
+        )
+        .unwrap();
+        block.grow_capacity(2 * old_len).unwrap();
+        let disk = block.disk.as_ref().unwrap();
+
+        let payload = vec![0x33u8; 4096];
+        let write_at = old_len + 0x1000;
+        let pending = disk
+            .submit_windows_raw_write_bounce(write_at, payload.clone())
+            .unwrap()
+            .expect("a write past the old length is inside the grown capacity");
+        let completion = disk.wait_windows_raw_completion().unwrap().unwrap();
+        pending.complete(completion).unwrap();
+
+        let pending = disk
+            .submit_windows_raw_read_bounce(write_at, payload.len())
+            .unwrap()
+            .expect("a read past the old length is inside the grown capacity");
+        let completion = disk.wait_windows_raw_completion().unwrap().unwrap();
+        let read = pending.complete(completion).unwrap();
+        assert_eq!(read.bytes, payload.len());
+
+        disk.flush_to_disk().unwrap();
+        use std::os::windows::fs::FileExt;
+        let reader = File::open(&image).unwrap();
+        let mut actual = vec![0u8; payload.len()];
+        reader.seek_read(&mut actual, write_at).unwrap();
+        assert_eq!(actual, payload);
 
         drop(reader);
         drop(block);

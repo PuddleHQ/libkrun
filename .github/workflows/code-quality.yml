@@ -6,7 +6,7 @@ jobs:
     name: libkrun (Linux x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -30,7 +30,7 @@ jobs:
     name: libkrun (Linux aarch64)
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -48,7 +48,7 @@ jobs:
     name: libkrun (macOS aarch64)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -71,13 +71,13 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
       
       - name: Cache GLib 2.82 + GTK 4.16 build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: gtk-cache
         with:
           path: ~/gtk-prefix

@@ -235,6 +235,15 @@ impl WindowsRawFile {
         self.completion_port.wait_any()
     }
 
+    /// Re-reads the file length after something else (Imago, during a live grow) resized the
+    /// image. The cached length bounds every overlapped request, so a stale one refuses I/O in
+    /// the grown range. The image only grows, hence `fetch_max`.
+    pub(super) fn refresh_size(&self) -> io::Result<()> {
+        let size = self.file.metadata()?.len();
+        self.size.fetch_max(size, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub(super) fn flush(&self) -> io::Result<()> {
         let ok = unsafe { FlushFileBuffers(self.file.as_raw_handle() as HANDLE) };
         if ok == 0 {

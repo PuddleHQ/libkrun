@@ -6,7 +6,7 @@ jobs:
     name: Integration Tests (Linux x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-logs-x86_64
           path: |
@@ -76,7 +76,7 @@ jobs:
   #   name: Integration Tests (Linux aarch64)
   #   runs-on: self-hosted
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
   #
   #     - name: Setup build environment
   #       uses: ./.github/actions/setup-build-env
@@ -121,7 +121,7 @@ jobs:
   #
   #     - name: Upload test logs
   #       if: always()
-  #       uses: actions/upload-artifact@v4
+  #       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
   #       with:
   #         name: test-logs-aarch64
   #         path: |

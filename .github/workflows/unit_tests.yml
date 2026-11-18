@@ -6,7 +6,7 @@ jobs:
     name: Unit tests (Linux x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -57,7 +57,7 @@ jobs:
     name: Unit tests (Windows x86_64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
@@ -124,7 +124,7 @@ jobs:
   #   name: Unit tests (Linux aarch64)
   #   runs-on: self-hosted
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
   #
   #     - name: Setup build environment
   #       uses: ./.github/actions/setup-build-env
